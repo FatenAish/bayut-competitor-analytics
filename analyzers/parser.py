@@ -1,11 +1,11 @@
 import re
 import json
-from typing import Optional
+from typing import Optional, Dict, Any, List
 from bs4 import BeautifulSoup
 
 
 def parse_html(html: str, page_url: Optional[str] = None) -> dict:
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html or "", "lxml")
 
     title = soup.title.get_text(strip=True) if soup.title else ""
 
@@ -17,40 +17,56 @@ def parse_html(html: str, page_url: Optional[str] = None) -> dict:
         tag = soup.find("meta", attrs={"property": prop})
         return (tag.get("content") or "").strip() if tag else ""
 
+    canonical = ""
+    canon = soup.find("link", attrs={"rel": "canonical"})
+    if canon and canon.get("href"):
+        canonical = str(canon.get("href")).strip()
+
     h1 = [h.get_text(" ", strip=True) for h in soup.find_all("h1")]
     h2 = [h.get_text(" ", strip=True) for h in soup.find_all("h2")]
     h3 = [h.get_text(" ", strip=True) for h in soup.find_all("h3")]
 
-    # Clean visible text
+    # Clean text
     clean = BeautifulSoup(str(soup), "lxml")
     for t in clean(["script", "style", "noscript"]):
         t.decompose()
-
     text = clean.get_text(" ", strip=True)
     word_count = len(re.findall(r"\b\w+\b", text))
 
-    # Counts needed by compliance/media
-    table_count = len(soup.find_all("table"))
-    image_count = len(soup.find_all("img"))
-    video_count = len(soup.find_all("video"))
-    iframe_count = len(soup.find_all("iframe"))
+    # Basic structure
+    img_tags = soup.find_all("img")
+    iframe_tags = soup.find_all("iframe")
+    table_tags = soup.find_all("table")
+    ul_tags = soup.find_all("ul")
+    ol_tags = soup.find_all("ol")
 
-    # Map signal (basic, works well)
-    has_map_signal = False
-    for iframe in soup.find_all("iframe"):
-        src = (iframe.get("src") or "").lower()
-        if "google.com/maps" in src or "maps.google" in src or "map" in src:
-            has_map_signal = True
-            break
+    image_count = len(img_tags)
+    iframe_count = len(iframe_tags)
+    table_count = len(table_tags)
+    list_count = len(ul_tags) + len(ol_tags)
 
-    # FAQ signal (used by compliance analyzer)
-    faq_signal = any(
-        "faq" in (h or "").lower() or "frequently asked" in (h or "").lower()
-        for h in (h2 + h3)
-    )
+    # Map detection (best-effort)
+    map_iframes = 0
+    for fr in iframe_tags:
+        src = (fr.get("src") or "").lower()
+        if any(k in src for k in ["google.com/maps", "mapbox", "openstreetmap", "arcgis", "/maps", "maps.google"]):
+            map_iframes += 1
 
-    # Schema detection
-    schema_types = []
+    has_map = map_iframes > 0 or (" map " in f" {text.lower()} " and "location" in text.lower())
+
+    # FAQ signal (best-effort)
+    headings_all = " ".join([*(h2 or []), *(h3 or [])]).lower()
+    question_like = 0
+    for hx in (h2 or []) + (h3 or []):
+        hx_s = (hx or "").strip()
+        if "?" in hx_s:
+            question_like += 1
+        elif re.match(r"^(what|why|how|where|when|is|are|can|does|do)\b", hx_s.strip().lower()):
+            question_like += 1
+    has_faq_signal = ("faq" in headings_all or "frequently asked" in headings_all or question_like >= 4)
+
+    # Schema types
+    schema_types: List[str] = []
     for s in soup.find_all("script", type="application/ld+json"):
         raw = (s.string or "").strip()
         if not raw:
@@ -67,10 +83,11 @@ def parse_html(html: str, page_url: Optional[str] = None) -> dict:
                         schema_types.append(str(t))
         except Exception:
             continue
-
     schema_types = list(dict.fromkeys(schema_types))
 
     return {
+        "page_url": (page_url or "").strip(),
+        "canonical": canonical,
         "title": title,
         "meta_description": meta("description"),
         "robots": meta("robots"),
@@ -83,11 +100,14 @@ def parse_html(html: str, page_url: Optional[str] = None) -> dict:
         "h3": h3,
         "word_count": word_count,
         "schema_types": schema_types,
-        "has_faq_signal": faq_signal,
-        "table_count": table_count,
-        "image_count": image_count,
-        "video_count": video_count,
-        "iframe_count": iframe_count,
-        "has_map_signal": has_map_signal,
         "raw_text": text,
+        # for compliance/media modules
+        "image_count": image_count,
+        "iframe_count": iframe_count,
+        "table_count": table_count,
+        "list_count": list_count,
+        "has_map": has_map,
+        "map_iframes": map_iframes,
+        "has_faq_signal": has_faq_signal,
+        "question_like_count": question_like,
     }
