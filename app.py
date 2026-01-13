@@ -1,74 +1,51 @@
 import streamlit as st
 import pandas as pd
 
-# 🔴 IMPORTANT: this is the ONLY import
 from analyzers.gaps import analyze_article
 
 
-# =====================================================
-# PAGE CONFIG
-# =====================================================
-st.set_page_config(
-    page_title="Bayut Competitor Gap Analysis",
-    layout="wide"
-)
+st.set_page_config(page_title="Bayut Competitor Gap Analysis", layout="wide")
 
 st.title("Bayut Competitor Editorial Gap Analysis")
-st.caption("Semantic gap detection based on editorial intent — not HTML structure.")
+st.caption("Outputs ONLY editorial gaps (short tables) — exactly like the approved examples.")
 
-# =====================================================
-# INPUTS
-# =====================================================
-with st.form("gap_form"):
+with st.form("form"):
     bayut_url = st.text_input(
         "Bayut article URL",
+        value="",
         placeholder="https://www.bayut.com/mybayut/..."
     )
 
-    competitor_urls_raw = st.text_area(
+    competitor_raw = st.text_area(
         "Competitor URLs (one per line, max 5)",
-        placeholder=(
-            "https://www.drivenproperties.com/...\n"
-            "https://www.propertyfinder.ae/...\n"
-        ),
-        height=120
+        value="",
+        height=120,
+        placeholder="https://...\nhttps://..."
     )
 
-    submitted = st.form_submit_button("Run analysis")
+    run = st.form_submit_button("Run")
 
+if run:
+    bayut_url = bayut_url.strip()
+    competitors = [u.strip() for u in competitor_raw.splitlines() if u.strip()]
 
-# =====================================================
-# RUN ANALYSIS
-# =====================================================
-if submitted:
-    if not bayut_url.strip():
-        st.error("Please enter a Bayut article URL.")
+    if not bayut_url:
+        st.error("Please enter the Bayut article URL.")
         st.stop()
 
-    competitor_urls = [
-        u.strip() for u in competitor_urls_raw.splitlines()
-        if u.strip()
-    ]
-
-    if not competitor_urls:
+    if not competitors:
         st.error("Please add at least one competitor URL.")
         st.stop()
 
-    if len(competitor_urls) > 5:
+    if len(competitors) > 5:
         st.warning("Only the first 5 competitor URLs will be analyzed.")
-        competitor_urls = competitor_urls[:5]
+        competitors = competitors[:5]
 
     with st.spinner("Analyzing competitors…"):
-        result = analyze_article(
-            bayut_url=bayut_url,
-            competitor_urls=competitor_urls
-        )
+        result = analyze_article(bayut_url, competitors)
 
     st.success("Analysis complete.")
 
-    # =================================================
-    # OUTPUT (ONE TABLE PER COMPETITOR — AS AGREED)
-    # =================================================
     for comp in result["results"]:
         st.markdown("---")
         st.subheader(comp["competitor"])
@@ -77,20 +54,12 @@ if submitted:
         rows = comp.get("rows", [])
 
         if not rows:
-            st.info("No significant editorial gaps detected for this competitor.")
+            st.info("No major editorial gaps detected for this competitor.")
             continue
 
         df = pd.DataFrame(rows)
 
-        # HARD SAFETY: enforce correct columns only
-        df = df[[
-            "Missing header",
-            "What the header contains",
-            "Source"
-        ]]
+        # enforce columns + order
+        df = df[["Missing header", "What the header contains", "Source"]]
 
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(df, use_container_width=True, hide_index=True)
