@@ -3,7 +3,7 @@ import json
 from bs4 import BeautifulSoup
 
 
-def parse_html(html: str) -> dict:
+def parse_html(html: str, page_url: str | None = None) -> dict:
     soup = BeautifulSoup(html, "lxml")
 
     title = soup.title.get_text(strip=True) if soup.title else ""
