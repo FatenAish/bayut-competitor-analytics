@@ -2,103 +2,46 @@ import re
 import json
 import time
 from urllib.parse import urlparse
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import requests
 from bs4 import BeautifulSoup
 
-# =========================================
-# HARD RULE: ONLY THESE GAP ROWS ARE ALLOWED
-# =========================================
-GAPS = [
-    {
-        "id": "comparison",
-        "title": "Comparison with Other Dubai Neighborhoods",
-        "desc": "Comparison between Business Bay and nearby areas (e.g., JLT/Downtown/Marina), highlighting differences in lifestyle, pricing, and community feel.",
-        "need": [r"\bcomparison\b", r"\bvs\b", r"\bversus\b", r"\bother dubai\b", r"\bneighbou?rhoods?\b", r"\bJLT\b", r"\bDowntown Dubai\b", r"\bDubai Marina\b"],
-        "avoid": [],
-    },
-    {
-        "id": "connectivity",
-        "title": "Location & Connectivity (expanded)",
-        "desc": "More specific detail on transport links and connectivity (metro/roads/access), beyond a basic location mention.",
-        "need": [r"\bmetro\b", r"\broad(s)?\b", r"\bhighway\b", r"\baccess\b", r"\bconnect(ion|ivity)\b", r"\bcommute\b"],
-        "avoid": [],
-    },
-    {
-        "id": "extras_pros",
-        "title": "Extras within Pros",
-        "desc": "Lifestyle-driven advantages (e.g., dining, nightlife, networking, modern urban appeal) that go beyond generic pros.",
-        "need": [r"\bnightlife\b", r"\bfine dining\b", r"\brestaurant(s)?\b", r"\bmichelin\b", r"\bnetwork(ing)?\b", r"\blifestyle\b"],
-        "avoid": [],
-    },
-    {
-        "id": "prefer_despite_cons",
-        "title": "Additional Reasons Some Prefer Business Bay",
-        "desc": "Explains why some residents still choose Business Bay despite the downsides (trade-offs, who it suits, why it’s worth it).",
-        "need": [r"\bdespite\b", r"\beven though\b", r"\bstill choose\b", r"\bworth it\b", r"\bwho should\b", r"\bsuits\b"],
-        "avoid": [],
-    },
-    {
-        "id": "final_thoughts",
-        "title": "Final Thoughts / Conclusion",
-        "desc": "A closing synthesis weighing pros and cons and guiding which types of residents the area is most suitable for.",
-        "need": [r"\bfinal thoughts\b", r"\bconclusion\b", r"\bin conclusion\b", r"\bsummary\b", r"\bto sum up\b"],
-        "avoid": [],
-    },
-    {
-        "id": "pros_detail",
-        "title": "Detailed “Pros” sub-sections",
-        "desc": "Pros are broken into clearer themes (amenities, lifestyle, transport, community) rather than a short/general list.",
-        "need": [r"\bpros\b", r"\badvantages\b", r"\bbenefits\b"],
-        "avoid": [],
-        "require_density": True,  # needs more than just one 'pros' mention
-    },
-    {
-        "id": "cons_detail",
-        "title": "Detailed “Cons” sub-sections",
-        "desc": "Cons are explicitly broken down (e.g., traffic, cost, crowding, limited green space) rather than a brief mention.",
-        "need": [r"\bcons\b", r"\bdisadvantages\b", r"\bdrawbacks\b", r"\btraffic\b", r"\bcongestion\b", r"\bcrowd(ed|ing)\b", r"\bgreen space(s)?\b", r"\bhigh cost\b"],
-        "avoid": [],
-        "require_density": True,
-    },
-    {
-        "id": "faqs",
-        "title": "FAQs",
-        "desc": "Competitor covers common questions (e.g., cost of living, schools, safety, market), which Bayut does not currently address as FAQs.",
-        "need": [r"\bFAQ\b", r"\bfrequently asked\b", r"\bhow much\b", r"\bcost of living\b", r"\bschools?\b", r"\bsafety\b", r"\bmarket\b"],
-        "avoid": [],
-        "faq_special": True,
-    },
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# Headings/blocks that must never become rows
+JUNK_HEADING_PATTERNS = [
+    r"looking to buy", r"looking to rent", r"subscribe", r"newsletter",
+    r"get in touch", r"contact", r"register", r"download", r"podcast",
+    r"latest", r"related", r"recommended", r"more (articles|blogs)",
 ]
 
-# junk headings/blocks we never want to treat as gaps
-JUNK = [
-    r"looking to buy", r"looking to rent", r"explore", r"latest blogs", r"podcasts?",
-    r"register", r"subscribe", r"get in touch", r"contact", r"please stand by"
+# Dubai area hints (used only to enrich comparison description)
+DUBAI_AREAS = [
+    "JLT", "Jumeirah Lakes Towers", "Downtown Dubai", "Dubai Marina",
+    "Business Bay", "DIFC", "Palm Jumeirah", "JBR", "Dubai Hills Estate",
+    "Arabian Ranches", "Deira", "Dubai Creek Harbour", "Business Bay"
 ]
 
-HEADERS = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"}
+
+# =====================================================
+# Utilities
+# =====================================================
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-# =========================================
-# FETCH + CLEAN TEXT (semantic only)
-# =========================================
-def _clean_text(s: str) -> str:
-    s = re.sub(r"\s+", " ", (s or "")).strip()
-    return s
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9\s]", "", _clean(s).lower())
 
 
-def _fetch_visible_text(url: str) -> str:
-    r = requests.get(url, headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    for bad in soup.find_all(["script", "style", "noscript", "nav", "footer", "header", "aside", "form"]):
-        bad.decompose()
-
-    text = _clean_text(soup.get_text(" "))
-    return text
+def _is_junk_heading(h: str) -> bool:
+    t = (h or "").lower()
+    return any(re.search(p, t) for p in JUNK_HEADING_PATTERNS)
 
 
 def _competitor_label(url: str) -> str:
@@ -114,22 +57,35 @@ def _competitor_label(url: str) -> str:
     return host.split(":")[0] if host else "Competitor"
 
 
-def _count(patterns: List[str], text: str) -> int:
-    total = 0
-    for p in patterns:
-        total += len(re.findall(p, text, flags=re.I))
-    return total
+def _fetch_html(url: str) -> str:
+    r = requests.get(url, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    return r.text
 
 
-def _has_junk(text: str) -> bool:
-    t = text.lower()
-    return any(re.search(p, t) for p in JUNK)
+def _parse_page(url: str) -> Dict[str, Any]:
+    html = _fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
 
+    # remove obvious noise blocks
+    for bad in soup.find_all(["script", "style", "noscript", "nav", "footer", "header", "aside", "form"]):
+        bad.decompose()
 
-def _extract_jsonld_faq_questions(html_text: str) -> List[str]:
-    soup = BeautifulSoup(html_text, "html.parser")
-    qs = []
-    for sc in soup.find_all("script", type="application/ld+json"):
+    headings = []
+    for tag in ["h1", "h2", "h3", "h4"]:
+        for el in soup.find_all(tag):
+            t = _clean(el.get_text(" ", strip=True))
+            if not t:
+                continue
+            if _is_junk_heading(t):
+                continue
+            headings.append(t)
+
+    full_text = _clean(soup.get_text(" ", strip=True))
+
+    # JSON-LD FAQ questions (if available)
+    faq_qs = []
+    for sc in soup.find_all("script", attrs={"type": "application/ld+json"}):
         raw = (sc.string or "").strip()
         if not raw:
             continue
@@ -140,106 +96,243 @@ def _extract_jsonld_faq_questions(html_text: str) -> List[str]:
 
         blocks = data if isinstance(data, list) else [data]
         for b in blocks:
-            graph = b.get("@graph", [b]) if isinstance(b, dict) else []
-            for g in graph:
-                if isinstance(g, dict) and g.get("@type") == "FAQPage":
+            if not isinstance(b, dict):
+                continue
+            graph = b.get("@graph")
+            candidates = graph if isinstance(graph, list) else [b]
+            for g in candidates:
+                if not isinstance(g, dict):
+                    continue
+                if g.get("@type") == "FAQPage":
                     ents = g.get("mainEntity", [])
                     if isinstance(ents, dict):
                         ents = [ents]
                     for ent in ents:
                         if isinstance(ent, dict):
-                            name = _clean_text(str(ent.get("name", "")))
-                            if name and name not in qs:
-                                qs.append(name)
-    return qs
+                            q = _clean(str(ent.get("name", "")))
+                            if q and q not in faq_qs:
+                                faq_qs.append(q)
+
+    return {
+        "url": url,
+        "source": _competitor_label(url),
+        "headings": headings,
+        "text": full_text,
+        "faq_questions": faq_qs,
+    }
 
 
-# =========================================
-# SEMANTIC GAP ENGINE (ONLY ALLOWED ROWS)
-# =========================================
-def _detect_gaps(bayut_text: str, comp_text: str, source: str) -> List[Dict[str, str]]:
-    bt = bayut_text.lower()
-    ct = comp_text.lower()
-
-    rows = []
-
-    # special: FAQs as ONE ROW (no explosion)
-    # If competitor has FAQ signals or JSONLD FAQ questions and Bayut doesn't -> include row
-    # (we treat Bayut FAQ absence as: few/none FAQ triggers)
-    for g in GAPS:
-        if not g.get("faq_special"):
-            continue
-        comp_score = _count(g["need"], comp_text)
-        bayut_score = _count(g["need"], bayut_text)
-        if comp_score >= 2 and bayut_score < 2:
-            rows.append({
-                "Missing header": g["title"],
-                "What the header contains": g["desc"],
-                "Source": source
-            })
-
-    # other gaps
-    for g in GAPS:
-        if g.get("faq_special"):
-            continue
-
-        comp_score = _count(g["need"], comp_text)
-        bayut_score = _count(g["need"], bayut_text)
-
-        # density requirement for pros/cons detail (avoid false positives)
-        if g.get("require_density"):
-            if comp_score < 5:
-                continue
-
-        # competitor has it, Bayut doesn't
-        if comp_score >= 2 and bayut_score < 2:
-            rows.append({
-                "Missing header": g["title"],
-                "What the header contains": g["desc"],
-                "Source": source
-            })
-
-    # de-dup by Missing header
-    seen = set()
-    out = []
-    for r in rows:
-        if r["Missing header"] in seen:
-            continue
-        seen.add(r["Missing header"])
-        out.append(r)
-
-    return out
+def _count_keywords(text: str, keywords: List[str]) -> int:
+    t = text.lower()
+    return sum(len(re.findall(r"\b" + re.escape(k) + r"\b", t)) for k in keywords)
 
 
-# =========================================
-# PUBLIC API
-# =========================================
+def _has_heading_like(headings: List[str], patterns: List[str]) -> bool:
+    for h in headings:
+        hl = h.lower()
+        for p in patterns:
+            if re.search(p, hl):
+                return True
+    return False
+
+
+def _extract_area_mentions(text: str) -> List[str]:
+    found = []
+    for a in DUBAI_AREAS:
+        if re.search(r"\b" + re.escape(a) + r"\b", text, flags=re.I):
+            if a not in found:
+                found.append(a)
+    # remove "Business Bay" from the list if present (comparison should show others)
+    found = [x for x in found if _norm(x) != _norm("Business Bay")]
+    return found[:3]
+
+
+# =====================================================
+# Semantic gap rules (rows are FIXED like your examples)
+# =====================================================
+def _competitor_has_comparison(comp: Dict[str, Any]) -> bool:
+    # heading strongly indicates comparison
+    if _has_heading_like(comp["headings"], [r"\bcomparison\b", r"\bvs\b", r"other .*neighbou?rhood"]):
+        return True
+    # text indicates comparison + mentions multiple areas
+    areas = _extract_area_mentions(comp["text"])
+    if len(areas) >= 1 and _count_keywords(comp["text"], ["comparison", "vs", "versus"]) >= 1:
+        return True
+    return False
+
+
+def _bayut_has_comparison(bayut: Dict[str, Any]) -> bool:
+    # Bayut should have a dedicated comparison heading to count as "covered"
+    return _has_heading_like(bayut["headings"], [r"\bcomparison\b", r"\bvs\b", r"other .*neighbou?rhood"])
+
+
+def _competitor_has_connectivity(comp: Dict[str, Any]) -> bool:
+    return (
+        _has_heading_like(comp["headings"], [r"connect", r"location", r"getting around", r"transport"])
+        or _count_keywords(comp["text"], ["metro", "road", "roads", "highway", "access", "connectivity", "commute"]) >= 4
+    )
+
+
+def _bayut_has_connectivity_expanded(bayut: Dict[str, Any]) -> bool:
+    # needs a transport/connectivity focused heading, not incidental "located in"
+    return _has_heading_like(bayut["headings"], [r"connect", r"getting around", r"transport", r"metro", r"road"])
+
+
+def _competitor_has_extras_within_pros(comp: Dict[str, Any]) -> bool:
+    return _count_keywords(comp["text"], ["michelin", "nightlife", "fine dining", "restaurants", "networking", "lifestyle"]) >= 3
+
+
+def _competitor_has_prefer_despite_cons(comp: Dict[str, Any]) -> bool:
+    return (
+        _has_heading_like(comp["headings"], [r"why .*prefer", r"despite", r"still choose", r"who .*suit"])
+        or _count_keywords(comp["text"], ["despite", "still choose", "worth it", "suits", "who should"]) >= 3
+    )
+
+
+def _competitor_has_final_thoughts(comp: Dict[str, Any]) -> bool:
+    return _has_heading_like(comp["headings"], [r"final thoughts", r"in summary", r"wrap up"])
+
+
+def _competitor_has_conclusion(comp: Dict[str, Any]) -> bool:
+    return _has_heading_like(comp["headings"], [r"\bconclusion\b", r"in conclusion"])
+
+
+def _competitor_has_detailed_pros(comp: Dict[str, Any]) -> bool:
+    # must be more than just one "pros" mention: look for structured pros sections or dense pros language
+    pros_heading = _has_heading_like(comp["headings"], [r"\bpros\b", r"advantages", r"benefits"])
+    pros_density = _count_keywords(comp["text"], ["pros", "advantages", "benefits"]) >= 6
+    return pros_heading and pros_density
+
+
+def _competitor_has_detailed_cons(comp: Dict[str, Any]) -> bool:
+    cons_heading = _has_heading_like(comp["headings"], [r"\bcons\b", r"disadvantages", r"drawbacks"])
+    cons_density = _count_keywords(comp["text"], ["cons", "disadvantages", "drawbacks", "traffic", "congestion", "high cost", "crowded", "green space"]) >= 6
+    return cons_heading and cons_density
+
+
+def _competitor_has_faqs(comp: Dict[str, Any]) -> bool:
+    if comp["faq_questions"]:
+        return True
+    # fallback: explicit FAQ heading or many question marks + common FAQ topics
+    if _has_heading_like(comp["headings"], [r"\bfaq\b", r"frequently asked"]):
+        return True
+    qmarks = comp["text"].count("?")
+    topic_hits = _count_keywords(comp["text"], ["cost of living", "schools", "safety", "market"])
+    return (qmarks >= 3 and topic_hits >= 1)
+
+
+def _bayut_has_faqs(bayut: Dict[str, Any]) -> bool:
+    return bool(bayut["faq_questions"]) or _has_heading_like(bayut["headings"], [r"\bfaq\b", r"frequently asked"])
+
+
+# =====================================================
+# PUBLIC: analyze_article (what app.py calls)
+# =====================================================
 def analyze_article(bayut_url: str, competitor_urls: List[str]) -> Dict[str, Any]:
-    # fetch Bayut
-    bayut_html = requests.get(bayut_url, headers=HEADERS, timeout=25).text
-    bayut_text = _fetch_visible_text(bayut_url)
+    bayut = _parse_page(bayut_url)
 
-    results = []
+    out_results = []
     for url in competitor_urls[:5]:
-        source = _competitor_label(url)
+        comp = _parse_page(url)
+        source = comp["source"]
 
-        try:
-            comp_html = requests.get(url, headers=HEADERS, timeout=25).text
-            comp_text = _fetch_visible_text(url)
+        rows: List[Dict[str, str]] = []
 
-            # If page is junk/blocked, return no rows rather than nonsense
-            if not comp_text or len(comp_text) < 300 or _has_junk(comp_text):
-                results.append({"competitor": source, "url": url, "rows": []})
+        # --- Comparison
+        if _competitor_has_comparison(comp) and not _bayut_has_comparison(bayut):
+            areas = _extract_area_mentions(comp["text"])
+            if areas:
+                desc = f"Comparison between the area and nearby neighborhoods such as {', '.join(areas)}, highlighting differences in price, community feel, and suitability."
+            else:
+                desc = "Comparison between the area and nearby neighborhoods, highlighting differences in price, community feel, and suitability."
+            rows.append({"Missing header": "Comparison with Other Dubai Neighborhoods", "What the header contains": desc, "Source": source})
+
+        # --- Connectivity expanded
+        if _competitor_has_connectivity(comp) and not _bayut_has_connectivity_expanded(bayut):
+            rows.append({
+                "Missing header": "Location & Connectivity (expanded)",
+                "What the header contains": "Competitor explains more specific transport links and connectivity benefits (metro/roads/access) beyond a basic location overview.",
+                "Source": source
+            })
+
+        # --- Extras within Pros
+        if _competitor_has_extras_within_pros(comp):
+            rows.append({
+                "Missing header": "Extras within Pros",
+                "What the header contains": "Lists lifestyle-driven advantages (e.g., dining, nightlife, networking, modern urban appeal) that are not covered on Bayut.",
+                "Source": source
+            })
+
+        # --- Additional Reasons Some Prefer (despite cons)
+        if _competitor_has_prefer_despite_cons(comp):
+            rows.append({
+                "Missing header": "Additional Reasons Some Prefer the Area",
+                "What the header contains": "Explains why some residents still choose the area despite the downsides, focusing on trade-offs and who it suits.",
+                "Source": source
+            })
+
+        # --- Final Thoughts / Conclusion split (like your examples)
+        if _competitor_has_final_thoughts(comp):
+            rows.append({
+                "Missing header": "Final Thoughts",
+                "What the header contains": "A final summarizing block weighing pros & cons and describing suitability for different resident types.",
+                "Source": source
+            })
+
+        if _competitor_has_conclusion(comp):
+            rows.append({
+                "Missing header": "Conclusion Summary",
+                "What the header contains": "A concluding wrap-up that helps readers decide if the area fits their needs.",
+                "Source": source
+            })
+
+        # --- Detailed Pros / Cons
+        if _competitor_has_detailed_pros(comp):
+            rows.append({
+                "Missing header": "Detailed “Pros” sub-sections",
+                "What the header contains": "Competitor breaks pros into clearer themes (location, amenities, community, transportation, family infrastructure) beyond Bayut’s coverage.",
+                "Source": source
+            })
+
+        if _competitor_has_detailed_cons(comp):
+            rows.append({
+                "Missing header": "Detailed “Cons” sub-sections",
+                "What the header contains": "Explicit breakdown of cons such as traffic, cost, crowding, and limited green spaces that Bayut does not cover in the same depth.",
+                "Source": source
+            })
+
+        # --- FAQs (ONE row only)
+        if _competitor_has_faqs(comp):
+            if not _bayut_has_faqs(bayut):
+                rows.append({
+                    "Missing header": "FAQs (missing questions)",
+                    "What the header contains": "Competitor includes FAQs around cost of living, schools, safety, and the local market that Bayut does not address as FAQs.",
+                    "Source": source
+                })
+            else:
+                # Bayut has FAQs, but competitor may have extra topics -> still keep ONE row (no explosion)
+                rows.append({
+                    "Missing header": "FAQs (missing questions)",
+                    "What the header contains": "Competitor covers additional FAQ topics (e.g., cost of living, schools, safety, market) that are missing from Bayut’s FAQ coverage.",
+                    "Source": source
+                })
+
+        # de-dup by Missing header (keep first)
+        seen = set()
+        deduped = []
+        for r in rows:
+            k = r["Missing header"].strip().lower()
+            if k in seen:
                 continue
+            seen.add(k)
+            deduped.append(r)
 
-            rows = _detect_gaps(bayut_text=bayut_text, comp_text=comp_text, source=source)
-
-            results.append({"competitor": source, "url": url, "rows": rows})
-
-        except Exception:
-            # fail safe: no spam rows, just empty
-            results.append({"competitor": source, "url": url, "rows": []})
+        out_results.append({
+            "competitor": source,
+            "url": url,
+            "rows": deduped
+        })
 
         time.sleep(0.35)
 
-    return {"bayut_url": bayut_url, "results": results}
+    return {"bayut_url": bayut_url, "results": out_results}
