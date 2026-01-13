@@ -1,103 +1,61 @@
-import re
+from typing import List, Dict, Any
 
 
-def _normalize(text: str) -> str:
-    return (text or "").lower().strip()
+def _get_parsed(page: Dict[str, Any]) -> Dict[str, Any]:
+    return page.get("parsed", {}) or {}
 
 
-def _infer_keywords_from_title(title: str) -> dict:
-    """
-    Infer focus + long-tail keywords from the title
-    """
-    t = _normalize(title)
-    words = [w for w in re.findall(r"\b\w+\b", t) if len(w) > 3]
-
-    focus_kw = " ".join(words[:3]) if len(words) >= 3 else t
-
-    long_tails = set()
-    if "pros" in t or "cons" in t:
-        long_tails.add(f"pros and cons of {focus_kw}")
-    if "living" in t:
-        long_tails.add(f"living in {focus_kw}")
-    if "business bay" in t:
-        long_tails.update({
-            "business bay rent",
-            "business bay lifestyle",
-            "business bay vs dubai marina",
-            "business bay vs downtown dubai",
-            "business bay vs jlt",
-        })
-
+def _metrics(page: Dict[str, Any]) -> Dict[str, Any]:
+    p = _get_parsed(page)
     return {
-        "focus_kw": focus_kw,
-        "long_tail_kws": list(long_tails)
+        "word_count": int(p.get("word_count", 0) or 0),
+        "h1_count": len(p.get("h1", []) or []),
+        "h2_count": len(p.get("h2", []) or []),
+        "h3_count": len(p.get("h3", []) or []),
+        "has_faq": bool(p.get("has_faq_signal", False)),
+        "table_count": int(p.get("table_count", 0) or 0),
+        "image_count": int(p.get("image_count", 0) or 0),
+        "video_count": int(p.get("video_count", 0) or 0),
+        "has_map": bool(p.get("has_map_signal", False)),
     }
 
 
-def compliance_analysis(bayut: dict, competitors: list[dict], title: str) -> list[dict]:
-    """
-    Returns rows suitable for a comparison table
-    """
-    kw_data = _infer_keywords_from_title(title)
-    focus_kw = kw_data["focus_kw"]
-    long_tails = kw_data["long_tail_kws"]
+def compliance_analysis(bayut: Dict[str, Any], competitors: List[Dict[str, Any]], title: str) -> List[Dict[str, str]]:
+    bay = _metrics(bayut)
 
-    results = []
+    # best competitor = highest word count
+    best = None
+    best_m = None
+    for c in competitors:
+        m = _metrics(c)
+        if best_m is None or m["word_count"] > best_m["word_count"]:
+            best, best_m = c, m
 
-    def check(page: dict):
-        text = page["parsed"]["raw_text"].lower()
-        h2 = " ".join(page["parsed"]["h2"]).lower()
+    if best is None:
+        return []
 
-        return {
-            "word_count": page["parsed"]["word_count"],
-            "h2_count": len(page["parsed"]["h2"]),
-            "has_summary": any(k in text[:500] for k in ["summary", "in short", "quick"]),
-            "has_faq": page["parsed"]["has_faq_signal"],
-            "has_comparison": any(v in h2 for v in ["vs", "comparison", "compare"]),
-            "has_tables": page["parsed"]["table_count"] > 0,
-            "internal_links": page["parsed"]["internal_links"],
-            "freshness": any(y in text for y in ["2024", "2025", "updated"]),
-            "focus_kw_usage": focus_kw in text,
-            "long_tail_usage": sum(1 for lt in long_tails if lt in text),
-        }
+    def row(check: str, b, c, rec: str) -> Dict[str, str]:
+        return {"Check": check, "Bayut": str(b), "Best competitor": str(c), "Recommendation": rec}
 
-    bayut_metrics = check(bayut)
+    rows = [
+        row("Word count", bay["word_count"], best_m["word_count"],
+            "Increase depth only where competitors have meaningful sections (comparison, prices, FAQs, transport)."),
+        row("H1 count", bay["h1_count"], best_m["h1_count"],
+            "Keep exactly 1 H1."),
+        row("H2 count", bay["h2_count"], best_m["h2_count"],
+            "Add missing H2 sections competitors use (not CTAs/newsletters)."),
+        row("H3 count", bay["h3_count"], best_m["h3_count"],
+            "Use H3 for sub-points inside key sections (e.g., Downtown/Marina/JLT under comparisons)."),
+        row("FAQ present", bay["has_faq"], best_m["has_faq"],
+            "Add a short FAQ block if competitors have it (helps AEO)."),
+        row("Tables", bay["table_count"], best_m["table_count"],
+            "Add 1 simple table if competitor uses one (rent ranges, pros/cons, commute)."),
+        row("Images", bay["image_count"], best_m["image_count"],
+            "Match competitor’s visual support (few strong images > many)."),
+        row("Video present", bay["video_count"], best_m["video_count"],
+            "Optional: add a short video only if competitors use it AND it helps explain the area."),
+        row("Map embed", bay["has_map"], best_m["has_map"],
+            "If competitor embeds a map, add one map section (location + key landmarks)."),
+    ]
 
-    best_comp = max(
-        (check(c) for c in competitors),
-        key=lambda x: (
-            x["long_tail_usage"],
-            x["has_comparison"],
-            x["has_tables"],
-            x["word_count"]
-        )
-    )
-
-    for factor in [
-        "word_count",
-        "h2_count",
-        "has_summary",
-        "has_faq",
-        "has_comparison",
-        "has_tables",
-        "internal_links",
-        "freshness",
-        "focus_kw_usage",
-        "long_tail_usage",
-    ]:
-        results.append({
-            "Factor": factor.replace("_", " ").title(),
-            "Bayut": bayut_metrics[factor],
-            "Best competitor": best_comp[factor],
-            "Gap": (
-                "Yes" if bayut_metrics[factor] < best_comp[factor]
-                else "No"
-            ),
-            "Recommendation": (
-                f"Improve {factor.replace('_', ' ')} to match competitors"
-                if bayut_metrics[factor] < best_comp[factor]
-                else "OK"
-            )
-        })
-
-    return results
+    return rows
