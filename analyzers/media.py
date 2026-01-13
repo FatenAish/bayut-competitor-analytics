@@ -1,34 +1,40 @@
-def media_comparison(bayut: dict, competitors: list[dict]) -> list[dict]:
+from typing import Dict, Any, List
+
+
+def _p(page: Dict[str, Any]) -> Dict[str, Any]:
+    return page.get("parsed", {}) or {}
+
+
+def media_flags(page: Dict[str, Any]) -> Dict[str, Any]:
+    p = _p(page)
+    return {
+        "images": int(p.get("image_count", 0) or 0),
+        "videos": int(p.get("video_count", 0) or 0),
+        "iframes": int(p.get("iframe_count", 0) or 0),
+        "tables": int(p.get("table_count", 0) or 0),
+        "map": bool(p.get("has_map_signal", False)),  # ✅ correct key
+        "og_image": bool((p.get("og_image") or "").strip()),
+    }
+
+
+def media_comparison(bayut: Dict[str, Any], competitors: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    bay = media_flags(bayut)
+
     rows = []
-
-    def media_flags(page):
-        return {
-            "map": page["parsed"]["has_map"],
-            "video": page["parsed"]["video_iframes"] > 0,
-            "tables": page["parsed"]["table_count"],
-            "images": page["parsed"]["img_count"],
-            "alt_missing_pct": (
-                round(
-                    (page["parsed"]["img_missing_alt"] / page["parsed"]["img_count"]) * 100,
-                    1
-                ) if page["parsed"]["img_count"] else 0
-            ),
-            "gallery": page["parsed"]["has_gallery"],
-        }
-
-    bayut_m = media_flags(bayut)
-
-    for comp in competitors:
-        comp_m = media_flags(comp)
-
-        for key in bayut_m:
-            if bayut_m[key] < comp_m[key]:
-                rows.append({
-                    "Media type": key.replace("_", " ").title(),
-                    "Bayut": bayut_m[key],
-                    "Competitor": comp_m[key],
-                    "Competitor source": comp["url"],
-                    "Recommendation": f"Add {key.replace('_', ' ')} (used by competitor)"
-                })
-
+    for c in competitors:
+        m = media_flags(c)
+        rows.append({
+            "Competitor": c.get("url", ""),
+            "Images": str(m["images"]),
+            "Video": "Yes" if m["videos"] > 0 else "No",
+            "Map": "Yes" if m["map"] else "No",
+            "Tables": str(m["tables"]),
+            "OG image": "Yes" if m["og_image"] else "No",
+            "What competitor has (vs Bayut)": ", ".join([
+                "Map" if (m["map"] and not bay["map"]) else "",
+                "Video" if (m["videos"] > 0 and bay["videos"] == 0) else "",
+                "More images" if (m["images"] > bay["images"]) else "",
+                "Tables" if (m["tables"] > 0 and bay["tables"] == 0) else "",
+            ]).replace(",,", ",").strip(" ,")
+        })
     return rows
