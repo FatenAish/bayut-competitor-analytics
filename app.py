@@ -6,7 +6,7 @@ from analyzers.parser import parse_html
 from analyzers.seo import seo_analysis
 from analyzers.schema import schema_analysis
 from analyzers.ai_readiness import ai_readiness_analysis
-from analyzers.gaps import update_gaps, new_post_strategy
+from analyzers.gaps import update_gaps
 from analyzers.compliance import compliance_analysis
 from analyzers.media import media_comparison
 from exporters.export import export_csv, export_excel, export_json
