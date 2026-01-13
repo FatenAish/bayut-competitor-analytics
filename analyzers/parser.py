@@ -20,6 +20,7 @@ def parse_html(html: str, page_url: str | None = None) -> dict:
     h2 = [h.get_text(" ", strip=True) for h in soup.find_all("h2")]
     h3 = [h.get_text(" ", strip=True) for h in soup.find_all("h3")]
 
+    # Clean visible text
     clean = BeautifulSoup(str(soup), "lxml")
     for t in clean(["script", "style", "noscript"]):
         t.decompose()
@@ -27,6 +28,7 @@ def parse_html(html: str, page_url: str | None = None) -> dict:
     text = clean.get_text(" ", strip=True)
     word_count = len(re.findall(r"\b\w+\b", text))
 
+    # Schema detection
     schema_types = []
     for s in soup.find_all("script", type="application/ld+json"):
         raw = (s.string or "").strip()
@@ -45,8 +47,13 @@ def parse_html(html: str, page_url: str | None = None) -> dict:
         except Exception:
             continue
 
-    # unique
     schema_types = list(dict.fromkeys(schema_types))
+
+    # FAQ signal (USED BY compliance.py)
+    faq_signal = any(
+        "faq" in h.lower() or "frequently asked" in h.lower()
+        for h in (h2 + h3)
+    )
 
     return {
         "title": title,
@@ -61,5 +68,6 @@ def parse_html(html: str, page_url: str | None = None) -> dict:
         "h3": h3,
         "word_count": word_count,
         "schema_types": schema_types,
+        "has_faq_signal": faq_signal,
         "raw_text": text,
     }
