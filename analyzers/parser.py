@@ -1,10 +1,205 @@
 import re
 import json
-from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
+# -----------------------------
+# Small helpers
+# -----------------------------
+_STOPWORDS = set("""
+a an and are as at be been being but by for from has have if in into is it its
+of on or that the to was were will with without you your we they their this these those
+""".split())
 
-def parse_html(html: str, page_url: Optional[str] = None) -> dict:
+def _clean_text(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _norm_heading(s: str) -> str:
+    s = _clean_text(s).lower()
+    s = re.sub(r"[\u2010-\u2015]", "-", s)          # dashes
+    s = re.sub(r"[^\w\s-]", "", s)                  # remove punctuation
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _guess_source_name(page_url: str) -> str:
+    if not page_url:
+        return "Competitor"
+    host = (urlparse(page_url).netloc or "").lower()
+    host = host.replace("www.", "")
+    if "propertyfinder" in host:
+        return "Property Finder"
+    if "drivenproperties" in host:
+        return "Driven Properties"
+    if "emaar" in host:
+        return "Emaar"
+    if "bayut" in host:
+        return "Bayut"
+    # fallback: domain as name
+    return host.split(":")[0]
+
+def _extract_jsonld(soup: BeautifulSoup) -> list:
+    blobs = []
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = (tag.string or "").strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                blobs.extend([x for x in data if isinstance(x, (dict, list))])
+            elif isinstance(data, dict):
+                blobs.append(data)
+        except Exception:
+            continue
+    return blobs
+
+def _find_faq_in_jsonld(jsonld_blobs: list) -> list[str]:
+    questions = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            t = node.get("@type") or node.get("type")
+            if isinstance(t, list):
+                types = [str(x) for x in t]
+            else:
+                types = [str(t)] if t else []
+
+            if any(x.lower() == "faqpage" for x in types):
+                main = node.get("mainEntity") or node.get("mainentity") or []
+                if isinstance(main, dict):
+                    main = [main]
+                for item in main:
+                    if isinstance(item, dict):
+                        name = item.get("name")
+                        if name:
+                            questions.append(_clean_text(str(name)))
+            # keep walking
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for x in node:
+                walk(x)
+
+    for b in jsonld_blobs:
+        walk(b)
+
+    # unique
+    out = []
+    seen = set()
+    for q in questions:
+        k = q.lower()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(q)
+    return out
+
+def _find_faq_in_dom(soup: BeautifulSoup) -> list[str]:
+    # Heuristic: containers with faq in class/id, then extract question-like lines
+    questions = []
+    containers = soup.find_all(attrs={"class": re.compile(r"\bf(a|)q\b", re.I)}) + \
+                 soup.find_all(attrs={"id": re.compile(r"\bf(a|)q\b", re.I)})
+
+    # also common accordion buttons
+    for c in containers:
+        # buttons/headings inside accordions often hold the question
+        for tag in c.find_all(["button", "summary", "h2", "h3", "h4", "p", "strong"]):
+            t = _clean_text(tag.get_text(" ", strip=True))
+            if not t:
+                continue
+            # “Question-like” heuristics
+            if "?" in t or t.lower().startswith(("what", "where", "how", "when", "why", "is ", "are ", "can ")):
+                # avoid very long paragraphs
+                if 5 <= len(t) <= 140:
+                    questions.append(t)
+
+    # unique
+    out, seen = [], set()
+    for q in questions:
+        k = q.lower()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(q)
+    return out[:25]
+
+def _sectionize(soup: BeautifulSoup) -> dict:
+    """
+    Build a simple map:
+      sections_norm[norm_title] = {
+        title, level, text, bullets
+      }
+    based on heading tags and following content until next heading.
+    """
+    body = soup.body or soup
+    sections = {}
+    order = []
+
+    current = None
+
+    def start_section(title: str, level: int):
+        nonlocal current
+        norm = _norm_heading(title)
+        if not norm:
+            return
+        current = norm
+        if norm not in sections:
+            sections[norm] = {"title": _clean_text(title), "level": level, "text": "", "bullets": []}
+            order.append(norm)
+
+    # initialize using first h1 as anchor if exists
+    for node in body.descendants:
+        if getattr(node, "name", None) in ("h1", "h2", "h3"):
+            title = node.get_text(" ", strip=True)
+            level = int(node.name[1])
+            start_section(title, level)
+            continue
+
+        if current and getattr(node, "name", None) in ("p", "li"):
+            t = _clean_text(node.get_text(" ", strip=True))
+            if not t:
+                continue
+            if node.name == "li":
+                sections[current]["bullets"].append(t)
+            else:
+                sections[current]["text"] += (t + " ")
+
+    # clean up
+    for k in list(sections.keys()):
+        sections[k]["text"] = _clean_text(sections[k]["text"])
+        # avoid mega bullets
+        sections[k]["bullets"] = [b for b in sections[k]["bullets"] if 3 <= len(b) <= 220][:40]
+
+    return {"sections": sections, "order": order}
+
+def _count_media(soup: BeautifulSoup) -> dict:
+    imgs = soup.find_all("img")
+    videos = soup.find_all("video")
+    iframes = soup.find_all("iframe")
+
+    # "map" heuristics: google maps iframe or map keywords
+    has_map = False
+    for fr in iframes:
+        src = (fr.get("src") or "").lower()
+        if "google.com/maps" in src or "maps.google" in src:
+            has_map = True
+            break
+    if not has_map:
+        txt = soup.get_text(" ", strip=True).lower()
+        if "map" in txt and ("google" in txt or "location" in txt):
+            has_map = True
+
+    table_count = len(soup.find_all("table"))
+
+    return {
+        "image_count": len(imgs),
+        "video_count": len(videos),
+        "iframe_count": len(iframes),
+        "table_count": table_count,
+        "has_map": has_map,
+    }
+
+def parse_html(html: str, page_url: str = "") -> dict:
     soup = BeautifulSoup(html or "", "lxml")
 
     title = soup.title.get_text(strip=True) if soup.title else ""
@@ -17,77 +212,49 @@ def parse_html(html: str, page_url: Optional[str] = None) -> dict:
         tag = soup.find("meta", attrs={"property": prop})
         return (tag.get("content") or "").strip() if tag else ""
 
-    canonical = ""
-    canon = soup.find("link", attrs={"rel": "canonical"})
-    if canon and canon.get("href"):
-        canonical = str(canon.get("href")).strip()
-
     h1 = [h.get_text(" ", strip=True) for h in soup.find_all("h1")]
     h2 = [h.get_text(" ", strip=True) for h in soup.find_all("h2")]
     h3 = [h.get_text(" ", strip=True) for h in soup.find_all("h3")]
 
-    # Clean text
+    # Clean visible text for word count
     clean = BeautifulSoup(str(soup), "lxml")
     for t in clean(["script", "style", "noscript"]):
         t.decompose()
+
     text = clean.get_text(" ", strip=True)
     word_count = len(re.findall(r"\b\w+\b", text))
 
-    # Basic structure
-    img_tags = soup.find_all("img")
-    iframe_tags = soup.find_all("iframe")
-    table_tags = soup.find_all("table")
-    ul_tags = soup.find_all("ul")
-    ol_tags = soup.find_all("ol")
+    # Schema types (simple list)
+    schema_types = []
+    jsonld_blobs = _extract_jsonld(soup)
+    for item in jsonld_blobs:
+        if isinstance(item, dict) and "@type" in item:
+            t = item["@type"]
+            if isinstance(t, list):
+                schema_types.extend([str(x) for x in t if x])
+            else:
+                schema_types.append(str(t))
 
-    image_count = len(img_tags)
-    iframe_count = len(iframe_tags)
-    table_count = len(table_tags)
-    list_count = len(ul_tags) + len(ol_tags)
+    schema_types = list(dict.fromkeys([x for x in schema_types if x]))
 
-    # Map detection (best-effort)
-    map_iframes = 0
-    for fr in iframe_tags:
-        src = (fr.get("src") or "").lower()
-        if any(k in src for k in ["google.com/maps", "mapbox", "openstreetmap", "arcgis", "/maps", "maps.google"]):
-            map_iframes += 1
+    # FAQ detection
+    faq_q_jsonld = _find_faq_in_jsonld(jsonld_blobs)
+    faq_q_dom = _find_faq_in_dom(soup)
+    faq_questions = []
+    seen = set()
+    for q in (faq_q_jsonld + faq_q_dom):
+        k = q.lower().strip()
+        if k and k not in seen:
+            seen.add(k)
+            faq_questions.append(q)
 
-    has_map = map_iframes > 0 or (" map " in f" {text.lower()} " and "location" in text.lower())
-
-    # FAQ signal (best-effort)
-    headings_all = " ".join([*(h2 or []), *(h3 or [])]).lower()
-    question_like = 0
-    for hx in (h2 or []) + (h3 or []):
-        hx_s = (hx or "").strip()
-        if "?" in hx_s:
-            question_like += 1
-        elif re.match(r"^(what|why|how|where|when|is|are|can|does|do)\b", hx_s.strip().lower()):
-            question_like += 1
-    has_faq_signal = ("faq" in headings_all or "frequently asked" in headings_all or question_like >= 4)
-
-    # Schema types
-    schema_types: List[str] = []
-    for s in soup.find_all("script", type="application/ld+json"):
-        raw = (s.string or "").strip()
-        if not raw:
-            continue
-        try:
-            data = json.loads(raw)
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                if isinstance(item, dict) and "@type" in item:
-                    t = item["@type"]
-                    if isinstance(t, list):
-                        schema_types.extend([str(x) for x in t if x])
-                    else:
-                        schema_types.append(str(t))
-        except Exception:
-            continue
-    schema_types = list(dict.fromkeys(schema_types))
+    section_pack = _sectionize(soup)
+    media = _count_media(soup)
 
     return {
-        "page_url": (page_url or "").strip(),
-        "canonical": canonical,
+        "page_url": page_url,
+        "source_name": _guess_source_name(page_url),
+
         "title": title,
         "meta_description": meta("description"),
         "robots": meta("robots"),
@@ -95,19 +262,15 @@ def parse_html(html: str, page_url: Optional[str] = None) -> dict:
         "og_title": meta_prop("og:title"),
         "og_description": meta_prop("og:description"),
         "og_image": meta_prop("og:image"),
+
         "h1": h1,
         "h2": h2,
         "h3": h3,
+
         "word_count": word_count,
         "schema_types": schema_types,
-        "raw_text": text,
-        # for compliance/media modules
-        "image_count": image_count,
-        "iframe_count": iframe_count,
-        "table_count": table_count,
-        "list_count": list_count,
-        "has_map": has_map,
-        "map_iframes": map_iframes,
-        "has_faq_signal": has_faq_signal,
-        "question_like_count": question_like,
-    }
+        "faq_questions": faq_questions,
+        "faq_count": len(faq_questions),
+
+        "sections": section_pack["sections"],
+        "
