@@ -56,15 +56,39 @@ def _get_main_container(soup: BeautifulSoup):
     return body if body else soup
 
 
+from bs4.element import Tag  # add near the top if not already imported
+
 def _strip_layout_noise(container):
-    # remove obvious layout blocks
-    for t in container.find_all(list(_IGNORE_TAGS)):
-        t.decompose()
-    # also remove common UI containers by class/id hint
+    if not container:
+        return
+
+    # remove obvious non-content blocks
+    kill_tags = {"header", "footer", "nav", "aside", "form"}
+    for x in container.find_all(kill_tags):
+        x.decompose()
+
+    # remove nodes by class/id keywords (safe attrs handling)
+    bad_words = (
+        "cookie", "consent", "gdpr", "subscribe", "newsletter", "signup",
+        "modal", "popup", "banner", "breadcrumbs", "breadcrumb",
+        "share", "social", "comment", "comments", "related", "recommend",
+        "sidebar", "sticky", "nav", "menu", "footer", "header", "promo", "ads", "advert"
+    )
+
     for t in container.find_all(True):
-        cid = " ".join(t.get("class", [])) + " " + (t.get("id", "") or "")
-        cid = cid.lower()
-        if any(x in cid for x in ["cookie", "consent", "subscribe", "newsletter", "breadcrumbs", "breadcrumb"]):
+        # ✅ only Tags have reliable attrs
+        if not isinstance(t, Tag):
+            continue
+
+        attrs = t.attrs or {}  # ✅ fixes attrs=None
+        cls = attrs.get("class") or []
+        if isinstance(cls, str):
+            cls = [cls]
+
+        tid = attrs.get("id") or ""
+        cid = (" ".join(cls) + " " + tid).lower()
+
+        if any(w in cid for w in bad_words):
             t.decompose()
 
 
