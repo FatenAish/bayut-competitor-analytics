@@ -1,162 +1,184 @@
 import re
-from difflib import SequenceMatcher
-from urllib.parse import urlparse
+from collections import defaultdict
 
 
-# =========================
-# Semantic detectors
-# =========================
-
-SEMANTIC_SECTIONS = {
-    "comparison": [
-        "comparison", "compare", "vs", "versus",
-        "other areas", "other neighborhoods", "other neighbourhoods",
-        "alternatives", "nearby areas"
-    ],
-    "faq": ["faq", "faqs", "frequently asked"],
-    "conclusion": ["conclusion", "final thoughts", "summary", "wrap up"]
-}
+# -----------------------------
+# helpers
+# -----------------------------
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
-# =========================
-# Helpers
-# =========================
-
-def _brand(url: str) -> str:
-    try:
-        host = urlparse(url).netloc.replace("www.", "")
-        return host.split(".")[0].replace("-", " ").title()
-    except Exception:
-        return "Competitor"
+def _is_semantic(header: str, keyword: str) -> bool:
+    h = _norm(header)
+    return keyword in h
 
 
-def _norm(s: str) -> str:
-    s = (s or "").lower()
-    s = re.sub(r"[^\w\s]", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
+def _extract_headers(parsed: dict):
+    return parsed.get("h2", []) + parsed.get("h3", [])
 
 
-def _similar(a: str, b: str) -> float:
-    return SequenceMatcher(None, _norm(a), _norm(b)).ratio()
+def _has_section(headers, keyword):
+    return any(_is_semantic(h, keyword) for h in headers)
 
 
-def _is_semantic(title: str, key: str) -> bool:
-    t = _norm(title)
-    return any(k in t for k in SEMANTIC_SECTIONS[key])
+def _extract_faq_questions(parsed: dict):
+    questions = []
+    for h in parsed.get("h3", []) + parsed.get("h4", []):
+        if h.strip().endswith("?"):
+            questions.append(h.strip())
+    return questions
 
 
-def _tokenize(text: str) -> set:
-    text = (text or "").lower()
-    words = re.findall(r"[a-z]{4,}", text)
-    stop = {"this", "that", "with", "from", "have", "will", "your", "about", "also"}
-    return set(w for w in words if w not in stop)
-
-
-# =========================
-# Main logic
-# =========================
-
+# -----------------------------
+# UPDATE MODE
+# -----------------------------
 def update_gaps(bayut_parsed: dict, competitors: list[dict]) -> list[dict]:
-    rows = []
+    """
+    Compare Bayut vs ALL competitors.
+    - Missing sections → shown once, aggregated
+    - Content gaps → only when header exists in Bayut
+    """
 
-    bayut_headers = bayut_parsed.get("h2", []) + bayut_parsed.get("h3", [])
-    bayut_text = bayut_parsed.get("raw_text", "")
+    bayut_headers = _extract_headers(bayut_parsed)
+    bayut_text = bayut_parsed.get("raw_text", "").lower()
 
-    # ---- Semantic presence in Bayut
     bayut_has = {
-        "comparison": any(_is_semantic(h, "comparison") for h in bayut_headers),
-        "faq": bool(bayut_parsed.get("faq_questions")),
-        "conclusion": any(_is_semantic(h, "conclusion") for h in bayut_headers),
+        "faq": _has_section(bayut_headers, "faq"),
+        "comparison": _has_section(bayut_headers, "comparison"),
+        "conclusion": _has_section(bayut_headers, "conclusion"),
+        "pros": _has_section(bayut_headers, "pros"),
+        "cons": _has_section(bayut_headers, "cons"),
     }
 
-    # ---- Track competitors
     found = {
-        "comparison": [],
-        "faq": [],
-        "conclusion": [],
+        "faq": {"sources": set(), "details": set()},
+        "comparison": {"sources": set(), "details": set()},
+        "conclusion": {"sources": set()},
+        "pros_gap": {"sources": set(), "details": set()},
+        "cons_gap": {"sources": set(), "details": set()},
     }
 
-    # =========================
-    # 1) SEMANTIC SECTIONS
-    # =========================
     for c in competitors:
         parsed = c["parsed"]
-        source = _brand(c["url"])
-        headers = parsed.get("h2", []) + parsed.get("h3", []) + parsed.get("h4", [])
-        text = parsed.get("raw_text", "")
+        source = c["url"]
+        headers = _extract_headers(parsed)
+        text = parsed.get("raw_text", "").lower()
 
-        if not bayut_has["comparison"] and any(_is_semantic(h, "comparison") for h in headers):
-            areas = sorted({
-                a for a in ["Downtown Dubai", "Dubai Marina", "JLT", "DIFC", "Jumeirah"]
-                if a.lower() in text.lower()
-            })
-            found["comparison"].append((source, areas))
+        # ---------------- FAQ ----------------
+        if not bayut_has["faq"]:
+            qs = _extract_faq_questions(parsed)
+            if qs:
+                found["faq"]["sources"].add(source)
+                for q in qs[:10]:
+                    found["faq"]["details"].add(q)
 
-        if not bayut_has["faq"] and parsed.get("faq_questions"):
-            found["faq"].append((source, parsed["faq_questions"][:8]))
+        # ---------------- COMPARISON ----------------
+        if not bayut_has["comparison"]:
+            if _has_section(headers, "comparison"):
+                found["comparison"]["sources"].add(source)
+                for area in [
+                    "downtown dubai",
+                    "dubai marina",
+                    "jlt",
+                    "difc",
+                    "business bay",
+                ]:
+                    if area in text:
+                        found["comparison"]["details"].add(area.title())
 
-        if not bayut_has["conclusion"] and any(_is_semantic(h, "conclusion") for h in headers):
-            found["conclusion"].append(source)
+        # ---------------- CONCLUSION ----------------
+        if not bayut_has["conclusion"]:
+            if _has_section(headers, "conclusion"):
+                found["conclusion"]["sources"].add(source)
 
-    # ---- Emit semantic rows
-    if found["comparison"]:
-        src, areas = found["comparison"][0]
+        # ---------------- PROS CONTENT GAP ----------------
+        if bayut_has["pros"] and _has_section(headers, "pros"):
+            competitor_terms = set(re.findall(r"\b[a-z]{6,}\b", text))
+            bayut_terms = set(re.findall(r"\b[a-z]{6,}\b", bayut_text))
+            diff = competitor_terms - bayut_terms
+            if diff:
+                found["pros_gap"]["sources"].add(source)
+                for w in list(diff)[:12]:
+                    found["pros_gap"]["details"].add(w)
+
+        # ---------------- CONS CONTENT GAP ----------------
+        if bayut_has["cons"] and _has_section(headers, "cons"):
+            competitor_terms = set(re.findall(r"\b[a-z]{6,}\b", text))
+            bayut_terms = set(re.findall(r"\b[a-z]{6,}\b", bayut_text))
+            diff = competitor_terms - bayut_terms
+            if diff:
+                found["cons_gap"]["sources"].add(source)
+                for w in list(diff)[:12]:
+                    found["cons_gap"]["details"].add(w)
+
+    # ---------------- OUTPUT ----------------
+    rows = []
+
+    if found["comparison"]["sources"]:
         rows.append({
-            "Missing section in Bayut": "Comparison with Other Areas",
-            "What competitors have": f"Area-level comparison ({', '.join(areas)})" if areas else "Area-level comparison",
-            "Why it matters": "Decision-support content present on competitors.",
-            "Source (competitor)": src
+            "Missing section in Bayut": "Comparison with Other Dubai Neighborhoods",
+            "What competitors have": ", ".join(sorted(found["comparison"]["details"])),
+            "Why it matters": "Area-level comparison present on competitors.",
+            "Source (competitor)": ", ".join(sorted(found["comparison"]["sources"])),
         })
 
-    if found["faq"]:
-        src, qs = found["faq"][0]
+    if found["faq"]["sources"]:
         rows.append({
             "Missing section in Bayut": "FAQs",
-            "What competitors have": "; ".join(qs),
+            "What competitors have": "; ".join(sorted(found["faq"]["details"])),
             "Why it matters": "Direct-question coverage difference.",
-            "Source (competitor)": src
+            "Source (competitor)": ", ".join(sorted(found["faq"]["sources"])),
         })
 
-    if found["conclusion"]:
+    if found["conclusion"]["sources"]:
         rows.append({
             "Missing section in Bayut": "Conclusion",
             "What competitors have": "Dedicated wrap-up / final summary section.",
             "Why it matters": "Structural completeness difference.",
-            "Source (competitor)": found["conclusion"][0]
+            "Source (competitor)": ", ".join(sorted(found["conclusion"]["sources"])),
         })
 
-    # =========================
-    # 2) CONTENT GAPS (existing headers)
-    # =========================
+    if found["pros_gap"]["sources"]:
+        rows.append({
+            "Missing section in Bayut": "Pros of Living in Business Bay (content gap)",
+            "What competitors have": ", ".join(sorted(found["pros_gap"]["details"])),
+            "Why it matters": "Detail coverage difference within the same section.",
+            "Source (competitor)": ", ".join(sorted(found["pros_gap"]["sources"])),
+        })
+
+    if found["cons_gap"]["sources"]:
+        rows.append({
+            "Missing section in Bayut": "Cons of Living in Business Bay (content gap)",
+            "What competitors have": ", ".join(sorted(found["cons_gap"]["details"])),
+            "Why it matters": "Detail coverage difference within the same section.",
+            "Source (competitor)": ", ".join(sorted(found["cons_gap"]["sources"])),
+        })
+
+    return rows
+
+
+# -----------------------------
+# NEW POST MODE
+# -----------------------------
+def new_post_strategy(title: str, competitors: list[dict]) -> dict:
+    """
+    Used ONLY for NEW POST mode.
+    Lists structural sections competitors use.
+    """
+
+    sections = defaultdict(set)
+
     for c in competitors:
         parsed = c["parsed"]
-        source = _brand(c["url"])
+        for h in _extract_headers(parsed):
+            sections[h.strip()].add(c["url"])
 
-        comp_headers = parsed.get("h2", []) + parsed.get("h3", [])
-        comp_text = parsed.get("raw_text", "")
+    output = []
+    for h, sources in sections.items():
+        output.append({
+            "Section title": h,
+            "Appears on competitors": ", ".join(sorted(sources))
+        })
 
-        for bh in bayut_headers:
-            if any(_similar(bh, ch) > 0.9 for ch in comp_headers):
-                missing_terms = sorted(_tokenize(comp_text) - _tokenize(bayut_text))
-                if len(missing_terms) >= 5:
-                    rows.append({
-                        "Missing section in Bayut": f"{bh} (content gap)",
-                        "What competitors have": ", ".join(missing_terms[:8]),
-                        "Why it matters": "Competitors cover additional details within the same section.",
-                        "Source (competitor)": source
-                    })
-
-    # ---- De-duplicate
-    unique = []
-    seen = set()
-    for r in rows:
-        key = (_norm(r["Missing section in Bayut"]), _norm(r["Source (competitor)"]))
-        if key not in seen:
-            seen.add(key)
-            unique.append(r)
-
-    return unique
-
-
-def new_post_strategy(bayut_title: str, competitors: list[dict]) -> dict:
-    return {"recommended_sections": []}
+    return {"recommended_sections": output}
