@@ -3,7 +3,7 @@ import pandas as pd
 
 from analyzers.fetcher import fetch_html
 from analyzers.parser import parse_html
-from analyzers.gaps import update_gaps, new_post_strategy
+from analyzers.gaps import update_gaps
 from exporters.export import export_csv, export_excel, export_json
 
 
