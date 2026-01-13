@@ -113,26 +113,59 @@ st.markdown(
 )
 
 # ==================================================
-# MODE SELECTION (CARDS)
+# MODE SELECTION (TRUE CENTER)
 # ==================================================
 st.markdown("<h3 class='center'>Choose your mode</h3>", unsafe_allow_html=True)
 
-col_left, col_center, col_right = st.columns([1, 6, 1])
+mode_clicked = st.markdown(
+    """
+    <div style="
+        display:flex;
+        justify-content:center;
+        gap:32px;
+        margin-top:30px;
+        margin-bottom:60px;
+    ">
+        <form method="post">
+            <button name="mode" value="update"
+                style="
+                    padding:18px 28px;
+                    border-radius:18px;
+                    border:1px solid #e5e7eb;
+                    background:white;
+                    font-size:16px;
+                    font-weight:600;
+                    cursor:pointer;
+                    box-shadow:0 10px 25px rgba(0,0,0,0.06);
+                ">
+                ✏️ Update Existing Article
+            </button>
+        </form>
 
-with col_center:
-    st.markdown("<div class='mode-wrapper'>", unsafe_allow_html=True)
+        <form method="post">
+            <button name="mode" value="new"
+                style="
+                    padding:18px 28px;
+                    border-radius:18px;
+                    border:1px solid #e5e7eb;
+                    background:white;
+                    font-size:16px;
+                    font-weight:600;
+                    cursor:pointer;
+                    box-shadow:0 10px 25px rgba(0,0,0,0.06);
+                ">
+                🆕 Plan New Article
+            </button>
+        </form>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
-    col_a, col_b = st.columns(2)
+# Capture mode selection safely
+if st.experimental_get_query_params().get("mode"):
+    st.session_state.mode = st.experimental_get_query_params()["mode"][0]
 
-    with col_a:
-        if st.button("✏️ Update Existing Article", key="update_mode"):
-            st.session_state.mode = "update"
-
-    with col_b:
-        if st.button("🆕 Plan New Article", key="new_mode"):
-            st.session_state.mode = "new"
-
-    st.markdown("</div>", unsafe_allow_html=True)
 
 # ==================================================
 # STOP UNTIL MODE SELECTED
