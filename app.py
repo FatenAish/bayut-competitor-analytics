@@ -238,6 +238,21 @@ if run:
         })
 
         st.dataframe(pd.DataFrame(schema_rows), use_container_width=True)
+        st.subheader("AI visibility (AI Overview / AEO / GEO)")
+ai_bayut = ai_readiness_analysis(bayut_parsed)
+
+ai_rows = []
+for g in ai_bayut.get("ai_gaps", []):
+    ai_rows.append({
+        "Missing for AI visibility": g,
+        "What to add": "Add a short direct answer + FAQ + clear comparisons + stats/figures where relevant."
+    })
+
+if ai_rows:
+    st.dataframe(pd.DataFrame(ai_rows), use_container_width=True)
+else:
+    st.success("No major AI visibility gaps detected by current rules (we will tighten this later).")
+
 
         # ---------------- AI VISIBILITY ----------------
         st.markdown("### AI visibility & AEO (what to add)")
