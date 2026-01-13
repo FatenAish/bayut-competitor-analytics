@@ -1,8 +1,16 @@
 import re
+import json
+import time
 from urllib.parse import urlparse
 from typing import List, Dict, Any
 
+import requests
+from bs4 import BeautifulSoup
 
+
+# =====================================================
+# CONFIG
+# =====================================================
 _IGNORE_PATTERNS = [
     r"subscribe",
     r"newsletter",
@@ -17,239 +25,254 @@ _IGNORE_PATTERNS = [
     r"latest blogs",
 ]
 
-_AREA_HINTS = [
-    "Dubai Marina",
-    "Downtown Dubai",
-    "DIFC",
-    "JLT",
-    "Jumeirah Lakes Towers",
-    "Business Bay",
-    "Palm Jumeirah",
-    "JBR",
-    "Jumeirah Beach Residence",
-    "Dubai Hills Estate",
-    "Arabian Ranches",
-    "Deira",
-    "Dubai Creek Harbour",
-    "The Valley",
-    "Emaar South",
-]
+_STOPWORDS = {
+    "about","above","after","again","against","along","among","around","because","before","being","below","between",
+    "could","does","doing","during","each","either","every","first","found","great","here","into","its","itself",
+    "many","might","more","most","other","over","some","such","than","that","their","there","these","those","through",
+    "under","very","what","where","which","while","would","your","yours",
+    "business","bay","dubai"
+}
+
+
+# =====================================================
+# NORMALIZATION
+# =====================================================
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
 
 def _norm(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"[^a-z0-9\s\?\&\:\(\)\-\/]", "", s)
-    return s.strip()
+    s = _clean(s).lower()
+    return re.sub(r"[^a-z0-9\s\?\-\(\)]", "", s)
 
 
 def _is_ignored_heading(title: str) -> bool:
-    t = (title or "").strip().lower()
-    for p in _IGNORE_PATTERNS:
-        if re.search(p, t):
-            return True
-    return False
+    t = title.lower()
+    return any(re.search(p, t) for p in _IGNORE_PATTERNS)
 
 
+# =====================================================
+# COMPETITOR LABEL
+# =====================================================
 def _competitor_label(url: str) -> str:
-    host = ""
-    try:
-        host = urlparse(url).netloc.lower().replace("www.", "")
-    except Exception:
-        host = ""
+    host = urlparse(url).netloc.lower().replace("www.", "")
+    if "bayut" in host:
+        return "Bayut"
     if "drivenproperties" in host:
         return "Driven Properties"
+    if "propertyfinder" in host:
+        return "Property Finder"
     if "dubizzle" in host:
         return "Dubizzle"
-    if "emaar" in host:
-        return "Emaar"
-    return host.split(":")[0] if host else "Competitor"
+    return host.split(":")[0] or "Competitor"
 
 
-def _get_section_text(parsed: Dict[str, Any], level: int, heading_text: str) -> str:
-    key = f"{level}:{heading_text}"
-    return (parsed.get("section_texts", {}) or {}).get(key, "") or ""
-
-
-def _extract_areas(text: str) -> str:
-    found = []
-    t = text or ""
-    for a in _AREA_HINTS:
-        if re.search(r"\b" + re.escape(a) + r"\b", t, flags=re.I):
-            found.append(a)
-    out = []
-    for x in found:
-        if x not in out:
-            out.append(x)
-    return ", ".join(out)
-
-
-def _faq_diff(bayut_parsed: Dict[str, Any], comp_parsed: Dict[str, Any]) -> str:
-    bq = set(_norm(x) for x in (bayut_parsed.get("faq_questions") or []) if x)
-    cq_raw = (comp_parsed.get("faq_questions") or [])
-    cq = [(x or "").strip() for x in cq_raw if x and (x or "").strip()]
-    missing = [x for x in cq if _norm(x) not in bq]
-    return "; ".join(missing[:8])
-
-
-def _keywords(text: str) -> List[str]:
-    text = text or ""
-    words = re.findall(r"[A-Za-z]{5,}", text)
-    words = [w.lower() for w in words]
-    stop = {
-        "about","above","after","again","against","along","among","around","because","before","being","below","between",
-        "could","does","doing","during","each","either","every","first","found","great","here","into","its","itself",
-        "many","might","more","most","other","over","some","such","than","that","their","there","these","those","through",
-        "under","very","what","where","which","while","would","your","yours",
-        "business","bay","dubai",
+# =====================================================
+# FETCH & PARSE
+# =====================================================
+def _fetch_html(url: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9",
     }
-    out = []
-    for w in words:
-        if w in stop:
+    r = requests.get(url, headers=headers, timeout=25)
+    r.raise_for_status()
+    return r.text
+
+
+def _visible_text(el) -> str:
+    for bad in el.find_all(["script", "style", "noscript"]):
+        bad.decompose()
+    return _clean(el.get_text(" ", strip=True))
+
+
+def _collect_section_text(heading) -> str:
+    lvl = int(heading.name[1])
+    chunks = []
+    node = heading
+
+    while True:
+        node = node.find_next_sibling()
+        if not node:
+            break
+        if getattr(node, "name", None) and node.name.startswith("h"):
+            if int(node.name[1]) <= lvl:
+                break
+        txt = _visible_text(node)
+        if txt:
+            chunks.append(txt)
+        if sum(len(c) for c in chunks) > 2500:
+            break
+
+    return " ".join(chunks)[:2500]
+
+
+def _extract_faq(soup: BeautifulSoup) -> List[str]:
+    qs = []
+
+    # JSON-LD first
+    for sc in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(sc.string or "")
+        except Exception:
             continue
-        if len(w) < 5:
-            continue
-        out.append(w)
-    uniq = []
-    for w in out:
-        if w not in uniq:
-            uniq.append(w)
-    return uniq[:12]
+
+        blocks = data if isinstance(data, list) else [data]
+        for b in blocks:
+            graph = b.get("@graph", [b])
+            for g in graph:
+                if g.get("@type") == "FAQPage":
+                    for q in g.get("mainEntity", []):
+                        name = _clean(q.get("name", ""))
+                        if name:
+                            qs.append(name)
+
+    if qs:
+        return list(dict.fromkeys(qs))
+
+    # Fallback: question-like headings / buttons
+    for el in soup.find_all(["h2", "h3", "button", "summary"]):
+        t = _clean(el.get_text())
+        if t.endswith("?"):
+            qs.append(t)
+
+    return list(dict.fromkeys(qs))[:20]
 
 
-def update_gaps(bayut_parsed: Dict[str, Any], competitors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Output rows (neutral):
-      Missing section in Bayut | What competitor has | Source (competitor)
+def parse_page(url: str) -> Dict[str, Any]:
+    html = _fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
 
-    Rules:
-      - H3 is analyzed alone
-      - H4 is also analyzed alone (not merged into H3)
-      - If Bayut has the header -> show (content gap) instead of “missing section”
-      - FAQ row = missing questions (competitor vs Bayut), even if Bayut has FAQ header
-      - Works per competitor: competitor1 rows + competitor2 rows + competitor3 rows in same table
-    """
+    parsed = {
+        "competitor_name": _competitor_label(url),
+        "h2": [],
+        "h3": [],
+        "h4": [],
+        "section_texts": {},
+        "faq_questions": [],
+        "word_count": 0,
+    }
+
+    body_text = _visible_text(soup.body or soup)
+    parsed["word_count"] = len(re.findall(r"\w+", body_text))
+
+    for tag in ["h2", "h3", "h4"]:
+        for h in soup.find_all(tag):
+            title = _clean(h.get_text())
+            if not title:
+                continue
+            parsed[tag].append(title)
+            txt = _collect_section_text(h)
+            if txt:
+                parsed["section_texts"][f"{tag[1]}:{title}"] = txt
+
+    parsed["faq_questions"] = _extract_faq(soup)
+    return parsed
+
+
+# =====================================================
+# GAP LOGIC
+# =====================================================
+def _keywords(text: str) -> List[str]:
+    words = re.findall(r"[A-Za-z]{5,}", text.lower())
+    return list(dict.fromkeys(
+        w for w in words if w not in _STOPWORDS
+    ))[:15]
+
+
+def _get_section(parsed, lvl, title):
+    return parsed["section_texts"].get(f"{lvl}:{title}", "")
+
+
+def update_gaps(bayut: Dict[str, Any], competitors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows = []
 
-    bayut_h2 = set(_norm(x) for x in (bayut_parsed.get("h2") or []))
-    bayut_h3 = set(_norm(x) for x in (bayut_parsed.get("h3") or []))
-    bayut_h4 = set(_norm(x) for x in (bayut_parsed.get("h4") or []))
-
-    def bayut_has_heading(text: str) -> bool:
-        n = _norm(text)
-        return (n in bayut_h2) or (n in bayut_h3) or (n in bayut_h4)
+    bayut_heads = {
+        _norm(h) for h in bayut["h2"] + bayut["h3"] + bayut["h4"]
+    }
 
     for comp in competitors:
-        comp_url = comp.get("url") or ""
-        comp_parsed = comp.get("parsed") or {}
-        source = comp_parsed.get("competitor_name") or _competitor_label(comp_url)
+        p = comp["parsed"]
+        source = p["competitor_name"]
 
-        comp_words = comp_parsed.get("word_count", 0) or 0
-        comp_h_total = len(comp_parsed.get("h2", [])) + len(comp_parsed.get("h3", [])) + len(comp_parsed.get("h4", []))
-        if comp_h_total == 0 and comp_words < 300:
-            rows.append({
-                "Missing section in Bayut": "(Competitor page not readable)",
-                "What competitor has": "Could not extract headings/content (JS-rendered or blocked).",
-                "Source (competitor)": source
-            })
-            continue
-
-        # 1) Missing sections: H2/H3/H4
-        for lvl_key in ["h2", "h3", "h4"]:
-            lvl = int(lvl_key[1])
-            for heading in (comp_parsed.get(lvl_key) or []):
-                if not heading or _is_ignored_heading(heading):
+        # ---- Missing headers
+        for tag in ["h2", "h3", "h4"]:
+            lvl = int(tag[1])
+            for h in p[tag]:
+                if _is_ignored_heading(h):
                     continue
-
-                # handle FAQ separately
-                hlow = heading.lower()
-                if "faq" in hlow or "frequently asked" in hlow:
-                    continue
-
-                if not bayut_has_heading(heading):
-                    txt = _get_section_text(comp_parsed, lvl, heading)
-
-                    if "comparison" in hlow or "other dubai" in hlow:
-                        areas = _extract_areas(txt)
-                        what_has = areas if areas else "Area-by-area comparison block (neighborhoods listed)."
-                    else:
-                        what_has = (txt[:180] + ("..." if len(txt) > 180 else "")) if txt else "Section exists on competitor."
-
+                if _norm(h) not in bayut_heads and "faq" not in h.lower():
+                    txt = _get_section(p, lvl, h)
                     rows.append({
-                        "Missing section in Bayut": heading,
-                        "What competitor has": what_has,
-                        "Source (competitor)": source
+                        "Missing header": h,
+                        "What the header contains": txt[:220] + ("..." if len(txt) > 220 else ""),
+                        "Source": source
                     })
 
-        # 2) FAQ missing questions
-        faq_missing = _faq_diff(bayut_parsed, comp_parsed)
-        if faq_missing:
+        # ---- Missing FAQ questions
+        bayut_faq = {_norm(q) for q in bayut["faq_questions"]}
+        missing_faq = [q for q in p["faq_questions"] if _norm(q) not in bayut_faq]
+        if missing_faq:
             rows.append({
-                "Missing section in Bayut": "FAQs",
-                "What competitor has": faq_missing,
-                "Source (competitor)": source
+                "Missing header": "FAQs",
+                "What the header contains": "; ".join(missing_faq[:10]),
+                "Source": source
             })
 
-        # 3) Content gaps for shared H2/H3 (not headers)
-        for lvl_key in ["h2", "h3"]:
-            lvl = int(lvl_key[1])
-            for heading in (comp_parsed.get(lvl_key) or []):
-                if not heading or _is_ignored_heading(heading):
+        # ---- Content gaps inside shared headers
+        for tag in ["h2", "h3", "h4"]:
+            lvl = int(tag[1])
+            for h in p[tag]:
+                if _norm(h) not in bayut_heads:
                     continue
-                if not bayut_has_heading(heading):
+                comp_txt = _get_section(p, lvl, h)
+                bayut_txt = _get_section(bayut, lvl, h)
+                if len(comp_txt) < 120:
                     continue
-
-                comp_txt = _get_section_text(comp_parsed, lvl, heading)
-                bayut_txt = _get_section_text(bayut_parsed, lvl, heading)
-
-                if len(comp_txt) < 80:
-                    continue
-
-                comp_k = set(_keywords(comp_txt))
-                bayut_k = set(_keywords(bayut_txt))
-                diff = [w for w in comp_k if w not in bayut_k]
-
+                diff = [
+                    w for w in _keywords(comp_txt)
+                    if w not in _keywords(bayut_txt)
+                ]
                 if len(diff) >= 5:
                     rows.append({
-                        "Missing section in Bayut": f"{heading} (content gap)",
-                        "What competitor has": ", ".join(diff[:10]),
-                        "Source (competitor)": source
+                        "Missing header": f"{h} (content gap)",
+                        "What the header contains": ", ".join(diff[:12]),
+                        "Source": source
                     })
 
-    # de-dup exact duplicates
+    # dedupe
     seen = set()
     out = []
     for r in rows:
-        key = (r["Missing section in Bayut"], r["What competitor has"], r["Source (competitor)"])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(r)
+        k = tuple(r.values())
+        if k not in seen:
+            seen.add(k)
+            out.append(r)
 
     return out
 
 
-def new_post_strategy(bayut_title: str, competitors: List[Dict[str, Any]]) -> Dict[str, Any]:
-    pool = []
-    for c in competitors:
-        p = c.get("parsed") or {}
-        source = p.get("competitor_name") or _competitor_label(c.get("url") or "")
-        for k in ["h2", "h3", "h4"]:
-            for h in (p.get(k) or []):
-                if not h or _is_ignored_heading(h):
-                    continue
-                pool.append((h, source))
+# =====================================================
+# MAIN ENTRY POINT
+# =====================================================
+def analyze_article(bayut_url: str, competitor_urls: List[str]) -> Dict[str, Any]:
+    bayut = parse_page(bayut_url)
 
-    by_title = {}
-    for title, src in pool:
-        t = title.strip()
-        if t not in by_title:
-            by_title[t] = []
-        if src not in by_title[t]:
-            by_title[t].append(src)
+    results = []
+    for url in competitor_urls[:5]:
+        parsed = parse_page(url)
+        rows = update_gaps(
+            bayut,
+            [{"url": url, "parsed": parsed}]
+        )
+        results.append({
+            "competitor": parsed["competitor_name"],
+            "url": url,
+            "rows": rows
+        })
+        time.sleep(0.4)
 
-    recommended_sections = []
-    for t, srcs in by_title.items():
-        recommended_sections.append({"Section": t, "Seen on": ", ".join(srcs)})
-
-    return {"recommended_sections": recommended_sections}
+    return {
+        "bayut_url": bayut_url,
+        "results": results
+    }
