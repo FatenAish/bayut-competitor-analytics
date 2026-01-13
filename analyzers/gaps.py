@@ -6,7 +6,7 @@ import re
 _JUNK_SECTION_PHRASES = [
     "newsletter", "inbox", "speak with us", "contact", "register your interest",
     "looking to rent", "looking to buy", "book a viewing", "enquire", "enquiry",
-    "call us", "sign up", "subscribe", "latest blogs", "podcasts", "today",
+    "call us", "sign up", "subscribe", "latest blogs", "podcasts",
 ]
 
 def _norm(s: str) -> str:
@@ -19,131 +19,151 @@ def _is_junk(title: str) -> bool:
     t = _norm(title)
     return any(p in t for p in _JUNK_SECTION_PHRASES)
 
-def _tokenize_keywords(text: str) -> list[str]:
-    text = (text or "").lower()
-    text = re.sub(r"[^a-z0-9\s-]", " ", text)
-    parts = [p.strip() for p in text.split() if p.strip()]
-    # keep “useful” tokens
-    out = []
-    for w in parts:
-        if len(w) < 4:
-            continue
-        if w in {"this", "that", "with", "from", "your", "have", "were", "will"}:
-            continue
-        out.append(w)
-    return out
-
-def _top_missing_terms(comp_text: str, bayut_text: str, limit: int = 6) -> list[str]:
-    c = set(_tokenize_keywords(comp_text))
-    b = set(_tokenize_keywords(bayut_text))
-    missing = [x for x in c if x not in b]
-    # prioritize “topic-like” terms
-    missing = sorted(missing, key=lambda x: (-len(x), x))
-    return missing[:limit]
-
-def _special_reco(title: str):
-    t = _norm(title)
-    if "comparison" in t and ("neighborhood" in t or "neighbourhood" in t or "areas" in t):
-        return (
-            "Add a comparison block with Downtown Dubai, Dubai Marina, JLT (1 short paragraph each).",
-            "Adds high-intent comparison content (SEO/AEO) and helps users decide faster."
-        )
-    if "faq" in t:
-        return (
-            "Add an FAQ block (5–8 questions) covering cost, commute, metro, rentals, lifestyle, best buildings.",
-            "Improves AEO/AI extraction and increases chances of being quoted in AI answers."
-        )
-    if "conclusion" in t:
-        return (
-            "Add a short conclusion: who Business Bay is best for + 3 bullet takeaways + next-step internal links.",
-            "Improves readability and strengthens AI summary extraction + user clarity."
-        )
-    return (None, None)
-
 def _section_text(parsed: dict, section_norm: str) -> str:
     sec = (parsed.get("sections") or {}).get(section_norm) or {}
     text = (sec.get("text") or "") + " " + " ".join(sec.get("bullets") or [])
     return text.strip()
+
+def _tokenize(text: str) -> list[str]:
+    text = (text or "").lower()
+    text = re.sub(r"[^a-z0-9\s-]", " ", text)
+    parts = [p.strip() for p in text.split() if p.strip()]
+    out = []
+    for w in parts:
+        if len(w) < 4:
+            continue
+        out.append(w)
+    return out
+
+def _missing_terms(comp_text: str, bayut_text: str, limit: int = 6) -> list[str]:
+    c = set(_tokenize(comp_text))
+    b = set(_tokenize(bayut_text))
+    miss = [x for x in c if x not in b]
+    miss = sorted(miss, key=lambda x: (-len(x), x))
+    return miss[:limit]
+
+def _build_parent_map(order: list[str], sections: dict) -> dict:
+    """
+    parent_map[child_norm] = parent_norm (nearest previous heading with smaller level)
+    """
+    parent_map = {}
+    stack = []  # list of (norm, level)
+    for norm in order:
+        sec = sections.get(norm) or {}
+        lvl = sec.get("level", 9)
+
+        while stack and stack[-1][1] >= lvl:
+            stack.pop()
+
+        parent_map[norm] = stack[-1][0] if stack else None
+        stack.append((norm, lvl))
+
+    return parent_map
+
+def _children_map(parent_map: dict) -> dict:
+    ch = {}
+    for child, parent in parent_map.items():
+        if not parent:
+            continue
+        ch.setdefault(parent, []).append(child)
+    return ch
+
 
 # -----------------------------
 # REQUIRED FUNCTIONS (used by app.py)
 # -----------------------------
 def update_gaps(bayut_parsed: dict, competitors: list[dict]) -> list[dict]:
     """
-    Output rows for the table:
-      - Missing headers in Bayut
-      - FAQ missing questions
-      - Content gaps under same header
+    Neutral output:
+    - Missing sections (collapse child headings under missing parent)
+    - FAQ missing questions (specific)
+    - Content gaps when same header exists
     """
     rows = []
 
     bayut_sections = bayut_parsed.get("sections") or {}
     bayut_norm_set = set(bayut_sections.keys())
 
-    # 1) Missing sections (headers)
+    # =============== 1) Missing sections (headers) with COLLAPSE ===============
     for c in competitors:
         cp = c.get("parsed") or {}
-        source = (cp.get("source_name") or c.get("url") or "Competitor")
-        comp_sections = cp.get("sections") or {}
+        source = cp.get("source_name") or c.get("url") or "Competitor"
 
-        for sec_norm, sec in comp_sections.items():
-            title = sec.get("title") or sec_norm
+        comp_sections = cp.get("sections") or {}
+        order = cp.get("section_order") or list(comp_sections.keys())
+
+        parent_map = _build_parent_map(order, comp_sections)
+        children_map = _children_map(parent_map)
+
+        # precompute missing flags
+        is_missing = {}
+        for norm in order:
+            sec = comp_sections.get(norm) or {}
+            title = sec.get("title") or norm
+            if not title or _is_junk(title):
+                is_missing[norm] = False
+                continue
+            is_missing[norm] = (norm not in bayut_norm_set)
+
+        for norm in order:
+            if not is_missing.get(norm):
+                continue
+
+            # If parent is also missing -> DO NOT list this child row
+            parent = parent_map.get(norm)
+            if parent and is_missing.get(parent):
+                continue
+
+            sec = comp_sections.get(norm) or {}
+            title = sec.get("title") or norm
             if not title or _is_junk(title):
                 continue
 
-            # missing header completely
-            if sec_norm not in bayut_norm_set:
-                reco, why = _special_reco(title)
-                if not reco:
-                    # generic: suggest top themes from competitor section
-                    comp_text = _section_text(cp, sec_norm)
-                    themes = _top_missing_terms(comp_text, "", limit=5)
-                    if themes:
-                        reco = f"Add a short section titled '{title}' covering: " + ", ".join(themes) + "."
-                    else:
-                        reco = f"Add a short section titled '{title}' (2–4 short paragraphs + bullets)."
-                    why = "Competitors cover this topic; adding it improves completeness and AI summarization."
+            # Gather missing children titles (collapsed under parent row)
+            child_titles = []
+            for child in children_map.get(norm, []):
+                if is_missing.get(child):
+                    csec = comp_sections.get(child) or {}
+                    ctitle = (csec.get("title") or child).strip()
+                    if ctitle and not _is_junk(ctitle):
+                        child_titles.append(ctitle)
 
-                rows.append({
-                    "Missing section in Bayut": title,
-                    "What to add (recommendation)": reco,
-                    "Why it matters": why,
-                    "Source (competitor)": source
-                })
+            comp_has = "Section exists on competitor."
+            if child_titles:
+                comp_has = "Includes subsections: " + ", ".join(child_titles)
 
-    # 2) FAQ gap (missing QUESTIONS)
-    bayut_faq = set([q.lower().strip() for q in (bayut_parsed.get("faq_questions") or [])])
-    faq_missing_by_source = []
-
-    for c in competitors:
-        cp = c.get("parsed") or {}
-        source = cp.get("source_name") or c.get("url") or "Competitor"
-        comp_faq = [q for q in (cp.get("faq_questions") or []) if q and len(q) <= 140]
-        comp_set = set([q.lower().strip() for q in comp_faq])
-
-        missing = [q for q in comp_faq if q.lower().strip() not in bayut_faq]
-        if missing:
-            faq_missing_by_source.append((source, missing[:8]))
-
-    if faq_missing_by_source:
-        # make 1 row per competitor to keep it clear
-        for source, missing_qs in faq_missing_by_source:
             rows.append({
-                "Missing section in Bayut": "FAQs (missing questions)",
-                "What to add (recommendation)": "Add these FAQ questions: " + "; ".join(missing_qs),
-                "Why it matters": "FAQ questions are direct-answer targets (AEO/AI Overview) and improve snippet visibility.",
+                "Missing section in Bayut": title,
+                "What competitors have": comp_has,
+                "Why it matters": "Content coverage difference (competitor includes it, Bayut doesn't).",
                 "Source (competitor)": source
             })
 
-    # 3) Content gaps under SAME header
-    # If competitor has same section title but Bayut section is thinner / missing key terms
+    # =============== 2) FAQ missing QUESTIONS (not generic) ===============
+    bayut_faq = set([q.lower().strip() for q in (bayut_parsed.get("faq_questions") or []) if q])
+
     for c in competitors:
         cp = c.get("parsed") or {}
         source = cp.get("source_name") or c.get("url") or "Competitor"
-        comp_sections = cp.get("sections") or {}
+        comp_faq = [q for q in (cp.get("faq_questions") or []) if q and len(q) <= 160]
 
+        missing_q = [q for q in comp_faq if q.lower().strip() not in bayut_faq]
+        if missing_q:
+            rows.append({
+                "Missing section in Bayut": "FAQs (missing questions)",
+                "What competitors have": "Questions present on competitor but not in Bayut: " + "; ".join(missing_q[:10]),
+                "Why it matters": "FAQ coverage difference.",
+                "Source (competitor)": source
+            })
+
+    # =============== 3) Content gaps under SAME header ===============
+    for c in competitors:
+        cp = c.get("parsed") or {}
+        source = cp.get("source_name") or c.get("url") or "Competitor"
+
+        comp_sections = cp.get("sections") or {}
         for sec_norm, sec in comp_sections.items():
-            title = sec.get("title") or sec_norm
+            title = (sec.get("title") or sec_norm).strip()
             if not title or _is_junk(title):
                 continue
 
@@ -151,18 +171,16 @@ def update_gaps(bayut_parsed: dict, competitors: list[dict]) -> list[dict]:
                 comp_text = _section_text(cp, sec_norm)
                 bay_text = _section_text(bayut_parsed, sec_norm)
 
-                missing_terms = _top_missing_terms(comp_text, bay_text, limit=6)
-
-                # only flag if meaningful gap
-                if len(missing_terms) >= 4:
+                miss_terms = _missing_terms(comp_text, bay_text, limit=6)
+                if len(miss_terms) >= 4:
                     rows.append({
                         "Missing section in Bayut": f"{title} (content gap)",
-                        "What to add (recommendation)": "Add missing points: " + ", ".join(missing_terms) + ".",
-                        "Why it matters": "Same section exists, but competitors include extra details that AI and users expect.",
+                        "What competitors have": "Competitor mentions extra topics/terms: " + ", ".join(miss_terms),
+                        "Why it matters": "Detail coverage difference within the same section.",
                         "Source (competitor)": source
                     })
 
-    # De-duplicate (same section + same source)
+    # De-dup
     dedup = []
     seen = set()
     for r in rows:
@@ -172,12 +190,12 @@ def update_gaps(bayut_parsed: dict, competitors: list[dict]) -> list[dict]:
         seen.add(key)
         dedup.append(r)
 
-    # Priority ordering
+    # Priority sort
     def score(r):
         t = _norm(r["Missing section in Bayut"])
         if "comparison" in t:
             return 0
-        if "faq" in t:
+        if "faqs" in t:
             return 1
         if "conclusion" in t:
             return 2
@@ -190,49 +208,26 @@ def update_gaps(bayut_parsed: dict, competitors: list[dict]) -> list[dict]:
 
 
 def new_post_strategy(bayut_title: str, competitors: list[dict]) -> dict:
-    """
-    Keep it simple for now: recommend key sections based on competitor headings + FAQ presence.
-    """
-    recommended = []
+    # leave as-is for now (simple)
+    rec = []
     seen = set()
-
     for c in competitors:
         cp = c.get("parsed") or {}
         source = cp.get("source_name") or c.get("url") or "Competitor"
-        comp_sections = cp.get("sections") or {}
-
-        for sec_norm, sec in comp_sections.items():
-            title = sec.get("title") or sec_norm
+        for sec_norm, sec in (cp.get("sections") or {}).items():
+            title = (sec.get("title") or sec_norm).strip()
             if not title or _is_junk(title):
                 continue
             k = _norm(title)
             if k in seen:
                 continue
             seen.add(k)
-
-            reco, why = _special_reco(title)
-            if not reco:
-                reco = f"Include a section titled '{title}' (short + bullets)."
-                why = "Competitors include it; it helps cover user intent and improves AI summaries."
-
-            recommended.append({
-                "Section to include": title,
-                "What to add (recommendation)": reco,
-                "Why it matters": why,
+            rec.append({
+                "Section": title,
                 "Source (competitor)": source
             })
 
-    # If competitors have FAQ signals, recommend FAQ explicitly
-    any_faq = any((c.get("parsed") or {}).get("faq_count", 0) > 0 for c in competitors)
-    if any_faq and "faqs" not in seen:
-        recommended.append({
-            "Section to include": "FAQs",
-            "What to add (recommendation)": "Add 5–8 FAQs (cost, rent, commute, metro, lifestyle, best buildings).",
-            "Why it matters": "Direct-answer format for AEO/AI Overview + improves snippet coverage.",
-            "Source (competitor)": "Multiple"
-        })
-
     return {
         "bayut_title": bayut_title,
-        "recommended_sections": recommended
+        "recommended_sections": rec
     }
