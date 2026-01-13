@@ -273,4 +273,9 @@ def parse_html(html: str, page_url: str = "") -> dict:
         "faq_count": len(faq_questions),
 
         "sections": section_pack["sections"],
-        "
+        "section_order": section_pack["order"],
+
+        **media,
+
+        "raw_text": text,
+    }
