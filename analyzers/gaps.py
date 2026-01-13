@@ -2,183 +2,172 @@ import re
 from collections import defaultdict
 
 
-# -----------------------------
+# -------------------------------
 # helpers
-# -----------------------------
-def _norm(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip().lower())
-
-
-def _is_semantic(header: str, keyword: str) -> bool:
-    h = _norm(header)
-    return keyword in h
-
-
-def _extract_headers(parsed: dict):
-    return parsed.get("h2", []) + parsed.get("h3", [])
+# -------------------------------
+def _normalize(t: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", t.lower()).strip()
 
 
 def _has_section(headers, keyword):
-    return any(_is_semantic(h, keyword) for h in headers)
+    keyword = _normalize(keyword)
+    return any(keyword in _normalize(h) for h in headers)
 
 
-def _extract_faq_questions(parsed: dict):
+def _extract_faq_questions(parsed):
     questions = []
     for h in parsed.get("h3", []) + parsed.get("h4", []):
-        if h.strip().endswith("?"):
+        if "?" in h:
             questions.append(h.strip())
     return questions
 
 
-# -----------------------------
-# UPDATE MODE
-# -----------------------------
-def update_gaps(bayut_parsed: dict, competitors: list[dict]) -> list[dict]:
+def _extract_areas(text):
+    areas = [
+        "business bay",
+        "downtown dubai",
+        "dubai marina",
+        "jlt",
+        "difc",
+        "dubai creek harbour",
+        "dubai hills estate",
+    ]
+    found = []
+    for a in areas:
+        if a in text:
+            found.append(a.title())
+    return found
+
+
+# -------------------------------
+# MAIN LOGIC
+# -------------------------------
+def update_gaps(bayut_parsed, competitors):
     """
-    Compare Bayut vs ALL competitors.
-    - Missing sections → shown once, aggregated
-    - Content gaps → only when header exists in Bayut
+    Returns:
+    [
+      {
+        Missing section in Bayut,
+        What competitors have,
+        Why it matters,
+        Source (competitor)
+      }
+    ]
     """
 
-    bayut_headers = _extract_headers(bayut_parsed)
+    # ---------------------------------
+    # Bayut signals
+    # ---------------------------------
+    bayut_h3 = bayut_parsed.get("h3", [])
+    bayut_h4 = bayut_parsed.get("h4", [])
     bayut_text = bayut_parsed.get("raw_text", "").lower()
 
     bayut_has = {
-        "faq": _has_section(bayut_headers, "faq"),
-        "comparison": _has_section(bayut_headers, "comparison"),
-        "conclusion": _has_section(bayut_headers, "conclusion"),
-        "pros": _has_section(bayut_headers, "pros"),
-        "cons": _has_section(bayut_headers, "cons"),
+        "comparison": _has_section(bayut_h3, "comparison"),
+        "faq": _has_section(bayut_h3, "faq"),
+        "conclusion": _has_section(bayut_h3, "conclusion"),
+        "pros": _has_section(bayut_h3, "pros"),
+        "cons": _has_section(bayut_h3, "cons"),
     }
 
-    found = {
-        "faq": {"sources": set(), "details": set()},
-        "comparison": {"sources": set(), "details": set()},
+    # ---------------------------------
+    # Aggregate competitor signals FIRST
+    # ---------------------------------
+    agg = {
+        "comparison": {"areas": set(), "sources": set()},
+        "faq": {"questions": set(), "sources": set()},
         "conclusion": {"sources": set()},
-        "pros_gap": {"sources": set(), "details": set()},
-        "cons_gap": {"sources": set(), "details": set()},
+        "pros_gap": {"terms": set(), "sources": set()},
+        "cons_gap": {"terms": set(), "sources": set()},
     }
 
     for c in competitors:
         parsed = c["parsed"]
         source = c["url"]
-        headers = _extract_headers(parsed)
+
+        h3 = parsed.get("h3", [])
+        h4 = parsed.get("h4", [])
         text = parsed.get("raw_text", "").lower()
 
-        # ---------------- FAQ ----------------
-        if not bayut_has["faq"]:
-            qs = _extract_faq_questions(parsed)
-            if qs:
-                found["faq"]["sources"].add(source)
-                for q in qs[:10]:
-                    found["faq"]["details"].add(q)
+        # ---- Comparison (H3 only)
+        if _has_section(h3, "comparison"):
+            agg["comparison"]["sources"].add(source)
+            for area in _extract_areas(text):
+                agg["comparison"]["areas"].add(area)
 
-        # ---------------- COMPARISON ----------------
-        if not bayut_has["comparison"]:
-            if _has_section(headers, "comparison"):
-                found["comparison"]["sources"].add(source)
-                for area in [
-                    "downtown dubai",
-                    "dubai marina",
-                    "jlt",
-                    "difc",
-                    "business bay",
-                ]:
-                    if area in text:
-                        found["comparison"]["details"].add(area.title())
+        # ---- FAQ (questions)
+        qs = _extract_faq_questions(parsed)
+        if qs:
+            agg["faq"]["sources"].add(source)
+            for q in qs:
+                agg["faq"]["questions"].add(q)
 
-        # ---------------- CONCLUSION ----------------
-        if not bayut_has["conclusion"]:
-            if _has_section(headers, "conclusion"):
-                found["conclusion"]["sources"].add(source)
+        # ---- Conclusion
+        if _has_section(h3, "conclusion"):
+            agg["conclusion"]["sources"].add(source)
 
-        # ---------------- PROS CONTENT GAP ----------------
-        if bayut_has["pros"] and _has_section(headers, "pros"):
-            competitor_terms = set(re.findall(r"\b[a-z]{6,}\b", text))
-            bayut_terms = set(re.findall(r"\b[a-z]{6,}\b", bayut_text))
-            diff = competitor_terms - bayut_terms
-            if diff:
-                found["pros_gap"]["sources"].add(source)
-                for w in list(diff)[:12]:
-                    found["pros_gap"]["details"].add(w)
+        # ---- Pros content gap (H4 under Pros H3)
+        if _has_section(h3, "pros"):
+            for h in h4:
+                if "pros" not in _normalize(h):
+                    agg["pros_gap"]["terms"].add(h)
+                    agg["pros_gap"]["sources"].add(source)
 
-        # ---------------- CONS CONTENT GAP ----------------
-        if bayut_has["cons"] and _has_section(headers, "cons"):
-            competitor_terms = set(re.findall(r"\b[a-z]{6,}\b", text))
-            bayut_terms = set(re.findall(r"\b[a-z]{6,}\b", bayut_text))
-            diff = competitor_terms - bayut_terms
-            if diff:
-                found["cons_gap"]["sources"].add(source)
-                for w in list(diff)[:12]:
-                    found["cons_gap"]["details"].add(w)
+        # ---- Cons content gap (H4 under Cons H3)
+        if _has_section(h3, "cons"):
+            for h in h4:
+                if "cons" not in _normalize(h):
+                    agg["cons_gap"]["terms"].add(h)
+                    agg["cons_gap"]["sources"].add(source)
 
-    # ---------------- OUTPUT ----------------
+    # ---------------------------------
+    # FINAL OUTPUT (neutral, clean)
+    # ---------------------------------
     rows = []
 
-    if found["comparison"]["sources"]:
+    # ---- Comparison
+    if agg["comparison"]["areas"] and not bayut_has["comparison"]:
         rows.append({
             "Missing section in Bayut": "Comparison with Other Dubai Neighborhoods",
-            "What competitors have": ", ".join(sorted(found["comparison"]["details"])),
+            "What competitors have": ", ".join(sorted(agg["comparison"]["areas"])),
             "Why it matters": "Area-level comparison present on competitors.",
-            "Source (competitor)": ", ".join(sorted(found["comparison"]["sources"])),
+            "Source (competitor)": ", ".join(sorted(agg["comparison"]["sources"])),
         })
 
-    if found["faq"]["sources"]:
+    # ---- FAQ
+    if agg["faq"]["questions"] and not bayut_has["faq"]:
         rows.append({
             "Missing section in Bayut": "FAQs",
-            "What competitors have": "; ".join(sorted(found["faq"]["details"])),
+            "What competitors have": "; ".join(sorted(list(agg["faq"]["questions"]))[:6]),
             "Why it matters": "Direct-question coverage difference.",
-            "Source (competitor)": ", ".join(sorted(found["faq"]["sources"])),
+            "Source (competitor)": ", ".join(sorted(agg["faq"]["sources"])),
         })
 
-    if found["conclusion"]["sources"]:
+    # ---- Conclusion
+    if agg["conclusion"]["sources"] and not bayut_has["conclusion"]:
         rows.append({
             "Missing section in Bayut": "Conclusion",
             "What competitors have": "Dedicated wrap-up / final summary section.",
             "Why it matters": "Structural completeness difference.",
-            "Source (competitor)": ", ".join(sorted(found["conclusion"]["sources"])),
+            "Source (competitor)": ", ".join(sorted(agg["conclusion"]["sources"])),
         })
 
-    if found["pros_gap"]["sources"]:
+    # ---- Pros content gap
+    if bayut_has["pros"] and agg["pros_gap"]["terms"]:
         rows.append({
             "Missing section in Bayut": "Pros of Living in Business Bay (content gap)",
-            "What competitors have": ", ".join(sorted(found["pros_gap"]["details"])),
+            "What competitors have": ", ".join(sorted(list(agg["pros_gap"]["terms"]))[:8]),
             "Why it matters": "Detail coverage difference within the same section.",
-            "Source (competitor)": ", ".join(sorted(found["pros_gap"]["sources"])),
+            "Source (competitor)": ", ".join(sorted(agg["pros_gap"]["sources"])),
         })
 
-    if found["cons_gap"]["sources"]:
+    # ---- Cons content gap
+    if bayut_has["cons"] and agg["cons_gap"]["terms"]:
         rows.append({
             "Missing section in Bayut": "Cons of Living in Business Bay (content gap)",
-            "What competitors have": ", ".join(sorted(found["cons_gap"]["details"])),
+            "What competitors have": ", ".join(sorted(list(agg["cons_gap"]["terms"]))[:8]),
             "Why it matters": "Detail coverage difference within the same section.",
-            "Source (competitor)": ", ".join(sorted(found["cons_gap"]["sources"])),
+            "Source (competitor)": ", ".join(sorted(agg["cons_gap"]["sources"])),
         })
 
     return rows
-
-
-# -----------------------------
-# NEW POST MODE
-# -----------------------------
-def new_post_strategy(title: str, competitors: list[dict]) -> dict:
-    """
-    Used ONLY for NEW POST mode.
-    Lists structural sections competitors use.
-    """
-
-    sections = defaultdict(set)
-
-    for c in competitors:
-        parsed = c["parsed"]
-        for h in _extract_headers(parsed):
-            sections[h.strip()].add(c["url"])
-
-    output = []
-    for h, sources in sections.items():
-        output.append({
-            "Section title": h,
-            "Appears on competitors": ", ".join(sorted(sources))
-        })
-
-    return {"recommended_sections": output}
