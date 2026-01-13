@@ -1,9 +1,10 @@
 import re
 import json
+from typing import Optional
 from bs4 import BeautifulSoup
 
 
-def parse_html(html: str, page_url: str | None = None) -> dict:
+def parse_html(html: str, page_url: Optional[str] = None) -> dict:
     soup = BeautifulSoup(html, "lxml")
 
     title = soup.title.get_text(strip=True) if soup.title else ""
@@ -16,6 +17,7 @@ def parse_html(html: str, page_url: str | None = None) -> dict:
         tag = soup.find("meta", attrs={"property": prop})
         return (tag.get("content") or "").strip() if tag else ""
 
+    # Headers
     h1 = [h.get_text(" ", strip=True) for h in soup.find_all("h1")]
     h2 = [h.get_text(" ", strip=True) for h in soup.find_all("h2")]
     h3 = [h.get_text(" ", strip=True) for h in soup.find_all("h3")]
@@ -49,7 +51,7 @@ def parse_html(html: str, page_url: str | None = None) -> dict:
 
     schema_types = list(dict.fromkeys(schema_types))
 
-    # FAQ signal (USED BY compliance.py)
+    # FAQ signal (used by compliance analyzer)
     faq_signal = any(
         "faq" in h.lower() or "frequently asked" in h.lower()
         for h in (h2 + h3)
