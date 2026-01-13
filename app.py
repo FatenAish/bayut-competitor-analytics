@@ -125,10 +125,8 @@ if run:
                 })
                 continue
 
-            parsed = parse_html(
-                result["html"],
-                page_url=result.get("final_url") or url
-            )
+            # IMPORTANT: parse_html only accepts (html: str) in your parser.py
+            parsed = parse_html(result["html"])
 
             competitors.append({
                 "url": url,
@@ -177,10 +175,8 @@ if run:
             st.error("Bayut URL could not be fetched.")
             st.stop()
 
-        bayut_parsed = parse_html(
-            bayut_result["html"],
-            page_url=bayut_result.get("final_url") or bayut_url
-        )
+        # IMPORTANT: parse_html only accepts (html: str) in your parser.py
+        bayut_parsed = parse_html(bayut_result["html"])
 
         bayut_data = {
             "url": bayut_url,
@@ -201,7 +197,7 @@ if run:
         compliance_rows = compliance_analysis(
             bayut=bayut_data,
             competitors=competitors,
-            title=bayut_parsed["title"]
+            title=bayut_parsed.get("title", "")
         )
         st.dataframe(
             pd.DataFrame(compliance_rows),
@@ -224,59 +220,58 @@ if run:
             st.info("Bayut matches or exceeds competitors in media usage.")
 
         # ---------------- SCHEMA ----------------
-        st.markdown("### Schema usage")
+        st.markdown("### Schema usage (Bayut vs competitors)")
         schema_rows = []
+
+        schema_rows.append({
+            "Page": "Bayut",
+            "Schema types": ", ".join(bayut_parsed.get("schema_types", [])) or "None"
+        })
+
         for c in competitors:
             schema_rows.append({
                 "Page": c["url"],
-                "Schema types": ", ".join(c["parsed"]["schema_types"]) or "None"
+                "Schema types": ", ".join(c["parsed"].get("schema_types", [])) or "None"
             })
 
-        schema_rows.insert(0, {
-            "Page": "Bayut",
-            "Schema types": ", ".join(bayut_parsed["schema_types"]) or "None"
-        })
-
         st.dataframe(pd.DataFrame(schema_rows), use_container_width=True)
-        st.subheader("AI visibility (AI Overview / AEO / GEO)")
-ai_bayut = ai_readiness_analysis(bayut_parsed)
-
-ai_rows = []
-for g in ai_bayut.get("ai_gaps", []):
-    ai_rows.append({
-        "Missing for AI visibility": g,
-        "What to add": "Add a short direct answer + FAQ + clear comparisons + stats/figures where relevant."
-    })
-
-if ai_rows:
-    st.dataframe(pd.DataFrame(ai_rows), use_container_width=True)
-else:
-    st.success("No major AI visibility gaps detected by current rules (we will tighten this later).")
-
 
         # ---------------- AI VISIBILITY ----------------
-        st.markdown("### AI visibility & AEO (what to add)")
-        ai_advice = []
-
+        st.markdown("### AI visibility (AI Overview / AEO / GEO) — what to add")
         ai = ai_readiness_analysis(bayut_parsed)
-        for gap in ai["ai_gaps"]:
-            ai_advice.append({"Recommendation": gap})
 
-        st.dataframe(pd.DataFrame(ai_advice), use_container_width=True)
+        ai_rows = []
+        for gap in ai.get("ai_gaps", []):
+            ai_rows.append({
+                "Missing for AI visibility": gap,
+                "What to add": "Add short direct answer + FAQ + clear comparisons + stats/figures where relevant."
+            })
+
+        if ai_rows:
+            st.dataframe(pd.DataFrame(ai_rows), use_container_width=True)
+        else:
+            st.success("No major AI visibility gaps detected by current rules (we will tighten this later).")
 
         # ---------------- FINAL RECOMMENDATIONS ----------------
         st.markdown("### Final recommendations (priority)")
         final_recs = []
 
         for row in compliance_rows:
-            if row["Gap"] == "Yes":
-                final_recs.append(row["Recommendation"])
+            if (row.get("Gap") or "").strip().lower() == "yes":
+                rec = row.get("Recommendation")
+                if rec:
+                    final_recs.append(rec)
 
+        # media_rows might not have "Recommendation" key, so only take if exists
         for row in media_rows:
-            final_recs.append(row["Recommendation"])
+            rec = row.get("Recommendation")
+            if rec:
+                final_recs.append(rec)
 
-        for row in ai_advice:
-            final_recs.append(row["Recommendation"])
+        for row in ai_rows:
+            rec = row.get("Missing for AI visibility")
+            if rec:
+                final_recs.append(rec)
 
         final_recs = list(dict.fromkeys(final_recs))[:10]
 
@@ -289,7 +284,8 @@ else:
             "missing_headers": missing_headers,
             "seo_compliance": compliance_rows,
             "media": media_rows,
-            "ai": ai_advice,
+            "schema": schema_rows,
+            "ai": ai_rows,
             "final_recommendations": final_recs
         }
 
@@ -297,7 +293,8 @@ else:
             "Missing_Headers": missing_headers,
             "SEO_Compliance": compliance_rows,
             "Media": media_rows,
-            "AI_Visibility": ai_advice,
+            "Schema": schema_rows,
+            "AI_Visibility": ai_rows,
             "Recommendations": [{"Recommendation": r} for r in final_recs]
         }
 
