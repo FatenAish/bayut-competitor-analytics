@@ -1,80 +1,58 @@
-def _norm(text: str) -> str:
-    return " ".join((text or "").lower().split())
+def normalize_header(h: str) -> str:
+    return " ".join(h.lower().strip().split())
 
 
-# ------------------------------------------------
-# UPDATE MODE: compare Bayut vs competitors
-# ------------------------------------------------
 def update_gaps(bayut_parsed: dict, competitors: list[dict]) -> list[dict]:
-    """
-    Return sections competitors have that Bayut is missing
-    with source URLs
-    """
-
-    bayut_sections = set(
-        _norm(h)
+    bayut_headers = {
+        normalize_header(h)
         for h in (bayut_parsed.get("h2", []) + bayut_parsed.get("h3", []))
-        if _norm(h)
-    )
+    }
 
-    competitor_sections = {}
+    rows = []
 
-    for comp in competitors:
-        url = comp["url"]
-        parsed = comp["parsed"]
+    for c in competitors:
+        comp_headers = {
+            normalize_header(h)
+            for h in (c["parsed"].get("h2", []) + c["parsed"].get("h3", []))
+        }
 
-        for h in parsed.get("h2", []) + parsed.get("h3", []):
-            key = _norm(h)
-            if not key:
-                continue
-            competitor_sections.setdefault(key, set()).add(url)
+        missing = comp_headers - bayut_headers
 
-    missing = []
-    for section, sources in competitor_sections.items():
-        if section not in bayut_sections:
-            missing.append({
-                "missing_section": section,
-                "sources": sorted(list(sources))
+        for h in missing:
+            rows.append({
+                "Missing section title": h.title(),
+                "Source": c["url"]
             })
 
-    return missing
+    # remove duplicates (same title from multiple competitors)
+    unique = {}
+    for r in rows:
+        key = r["Missing section title"]
+        unique.setdefault(key, []).append(r["Source"])
+
+    return [
+        {
+            "Missing section title": k,
+            "Sources": ", ".join(sorted(set(v)))
+        }
+        for k, v in unique.items()
+    ]
 
 
-# ------------------------------------------------
-# NEW POST MODE: what to include to beat competitors
-# ------------------------------------------------
 def new_post_strategy(bayut_title: str, competitors: list[dict]) -> dict:
-    """
-    Build recommended sections for a new Bayut article
-    """
+    headers = {}
 
-    section_map = {}
-
-    for comp in competitors:
-        url = comp["url"]
-        parsed = comp["parsed"]
-
-        for h in parsed.get("h2", []) + parsed.get("h3", []):
-            key = _norm(h)
-            if not key:
-                continue
-            section_map.setdefault(key, set()).add(url)
-
-    ranked = sorted(
-        section_map.items(),
-        key=lambda x: len(x[1]),
-        reverse=True
-    )
-
-    recommendations = []
-    for section, sources in ranked:
-        recommendations.append({
-            "recommended_section": section,
-            "covered_by_competitors": len(sources),
-            "sources": sorted(list(sources))
-        })
+    for c in competitors:
+        for h in c["parsed"].get("h2", []) + c["parsed"].get("h3", []):
+            key = normalize_header(h)
+            headers.setdefault(key, []).append(c["url"])
 
     return {
-        "bayut_title": bayut_title,
-        "recommended_sections": recommendations
+        "recommended_sections": [
+            {
+                "Recommended section title": k.title(),
+                "Sources": ", ".join(sorted(set(v)))
+            }
+            for k, v in headers.items()
+        ]
     }
