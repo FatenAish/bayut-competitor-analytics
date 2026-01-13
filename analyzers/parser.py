@@ -3,201 +3,203 @@ import json
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
-# -----------------------------
-# Small helpers
-# -----------------------------
-_STOPWORDS = set("""
-a an and are as at be been being but by for from has have if in into is it its
-of on or that the to was were will with without you your we they their this these those
-""".split())
+
+_STOP = {
+    "the","and","for","with","that","this","from","you","your","are","was","were","will","have","has","had",
+    "but","not","can","may","more","most","into","than","then","they","them","their","our","out","about",
+    "also","over","under","between","within","near","where","when","what","why","how","who","which",
+    "a","an","to","of","in","on","at","as","is","it","be","or","by"
+}
+
+_IGNORE_TAGS = {"nav", "footer", "header", "aside", "form", "noscript", "script", "style"}
+
 
 def _clean_text(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\s+", " ", (s or "")).strip()
     return s
+
 
 def _norm_heading(s: str) -> str:
     s = _clean_text(s).lower()
-    s = re.sub(r"[\u2010-\u2015]", "-", s)          # dashes
-    s = re.sub(r"[^\w\s-]", "", s)                  # remove punctuation
+    s = re.sub(r"[\|\-\—\–•·•]+", " ", s)
+    s = re.sub(r"[^a-z0-9\s\?\&\(\)\:\/]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def _guess_source_name(page_url: str) -> str:
-    if not page_url:
-        return "Competitor"
-    host = (urlparse(page_url).netloc or "").lower()
+
+def _competitor_name_from_url(url: str) -> str:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        host = ""
     host = host.replace("www.", "")
-    if "propertyfinder" in host:
-        return "Property Finder"
+
     if "drivenproperties" in host:
         return "Driven Properties"
+    if "dubizzle" in host:
+        return "Dubizzle"
     if "emaar" in host:
         return "Emaar"
-    if "bayut" in host:
-        return "Bayut"
-    # fallback: domain as name
+    if not host:
+        return "Competitor"
     return host.split(":")[0]
 
-def _extract_jsonld(soup: BeautifulSoup) -> list:
-    blobs = []
-    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        raw = (tag.string or "").strip()
+
+def _get_main_container(soup: BeautifulSoup):
+    main = soup.find("main")
+    if main:
+        return main
+    article = soup.find("article")
+    if article:
+        return article
+    body = soup.body
+    return body if body else soup
+
+
+def _strip_layout_noise(container):
+    # remove obvious layout blocks
+    for t in container.find_all(list(_IGNORE_TAGS)):
+        t.decompose()
+    # also remove common UI containers by class/id hint
+    for t in container.find_all(True):
+        cid = " ".join(t.get("class", [])) + " " + (t.get("id", "") or "")
+        cid = cid.lower()
+        if any(x in cid for x in ["cookie", "consent", "subscribe", "newsletter", "breadcrumbs", "breadcrumb"]):
+            t.decompose()
+
+
+def _extract_schema_types(soup: BeautifulSoup):
+    schema_types = []
+    for s in soup.find_all("script", type="application/ld+json"):
+        raw = (s.string or "").strip()
         if not raw:
             continue
         try:
             data = json.loads(raw)
-            if isinstance(data, list):
-                blobs.extend([x for x in data if isinstance(x, (dict, list))])
-            elif isinstance(data, dict):
-                blobs.append(data)
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if isinstance(item, dict):
+                    t = item.get("@type")
+                    if isinstance(t, list):
+                        schema_types.extend([str(x) for x in t if x])
+                    elif t:
+                        schema_types.append(str(t))
         except Exception:
             continue
-    return blobs
 
-def _find_faq_in_jsonld(jsonld_blobs: list) -> list[str]:
-    questions = []
+    schema_types = list(dict.fromkeys(schema_types))
+    return schema_types
 
-    def walk(node):
-        if isinstance(node, dict):
-            t = node.get("@type") or node.get("type")
-            if isinstance(t, list):
-                types = [str(x) for x in t]
-            else:
-                types = [str(t)] if t else []
 
-            if any(x.lower() == "faqpage" for x in types):
-                main = node.get("mainEntity") or node.get("mainentity") or []
-                if isinstance(main, dict):
-                    main = [main]
-                for item in main:
-                    if isinstance(item, dict):
-                        name = item.get("name")
-                        if name:
-                            questions.append(_clean_text(str(name)))
-            # keep walking
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for x in node:
-                walk(x)
+def _has_map(container: BeautifulSoup) -> bool:
+    # google maps / mapbox / embeds
+    for iframe in container.find_all("iframe"):
+        src = (iframe.get("src") or "").lower()
+        if "google.com/maps" in src or "mapbox" in src or "maps/embed" in src or "embed?pb=" in src:
+            return True
+    txt = container.get_text(" ", strip=True).lower()
+    if "view on map" in txt or "google map" in txt:
+        return True
+    return False
 
-    for b in jsonld_blobs:
-        walk(b)
 
-    # unique
-    out = []
-    seen = set()
-    for q in questions:
-        k = q.lower()
-        if k and k not in seen:
-            seen.add(k)
-            out.append(q)
-    return out
+def _count_media(container: BeautifulSoup) -> dict:
+    img_count = len([i for i in container.find_all("img") if (i.get("src") or "").strip()])
+    table_count = len(container.find_all("table"))
+    video_count = len(container.find_all("video"))
 
-def _find_faq_in_dom(soup: BeautifulSoup) -> list[str]:
-    # Heuristic: containers with faq in class/id, then extract question-like lines
-    questions = []
-    containers = soup.find_all(attrs={"class": re.compile(r"\bf(a|)q\b", re.I)}) + \
-                 soup.find_all(attrs={"id": re.compile(r"\bf(a|)q\b", re.I)})
+    # youtube/vimeo iframes count as video
+    for iframe in container.find_all("iframe"):
+        src = (iframe.get("src") or "").lower()
+        if "youtube.com" in src or "youtu.be" in src or "vimeo.com" in src:
+            video_count += 1
 
-    # also common accordion buttons
-    for c in containers:
-        # buttons/headings inside accordions often hold the question
-        for tag in c.find_all(["button", "summary", "h2", "h3", "h4", "p", "strong"]):
-            t = _clean_text(tag.get_text(" ", strip=True))
-            if not t:
-                continue
-            # “Question-like” heuristics
-            if "?" in t or t.lower().startswith(("what", "where", "how", "when", "why", "is ", "are ", "can ")):
-                # avoid very long paragraphs
-                if 5 <= len(t) <= 140:
-                    questions.append(t)
+    return {"image_count": img_count, "video_count": video_count, "table_count": table_count}
 
-    # unique
-    out, seen = [], set()
-    for q in questions:
-        k = q.lower()
-        if k and k not in seen:
-            seen.add(k)
-            out.append(q)
-    return out[:25]
 
-def _sectionize(soup: BeautifulSoup) -> dict:
+def _build_headings_and_sections(container: BeautifulSoup):
     """
-    Build a simple map:
-      sections_norm[norm_title] = {
-        title, level, text, bullets
-      }
-    based on heading tags and following content until next heading.
+    Returns:
+      headings: list of {"level":2|3|4, "text":str}
+      section_texts: dict[(level,text)] => extracted text under that heading
     """
-    body = soup.body or soup
-    sections = {}
-    order = []
+    headings = []
+    section_texts = {}
 
-    current = None
+    # collect heading nodes in order
+    nodes = container.find_all(["h2", "h3", "h4"])
+    for n in nodes:
+        level = int(n.name[1])
+        txt = _clean_text(n.get_text(" ", strip=True))
+        if txt:
+            headings.append({"level": level, "text": txt})
 
-    def start_section(title: str, level: int):
-        nonlocal current
-        norm = _norm_heading(title)
-        if not norm:
-            return
-        current = norm
-        if norm not in sections:
-            sections[norm] = {"title": _clean_text(title), "level": level, "text": "", "bullets": []}
-            order.append(norm)
-
-    # initialize using first h1 as anchor if exists
-    for node in body.descendants:
-        if getattr(node, "name", None) in ("h1", "h2", "h3"):
-            title = node.get_text(" ", strip=True)
-            level = int(node.name[1])
-            start_section(title, level)
+    # extract text under each heading until next heading of same-or-higher priority
+    # h2 stops at next h2; h3 stops at next h2/h3; h4 stops at next h2/h3/h4
+    for n in nodes:
+        level = int(n.name[1])
+        title = _clean_text(n.get_text(" ", strip=True))
+        if not title:
             continue
 
-        if current and getattr(node, "name", None) in ("p", "li"):
-            t = _clean_text(node.get_text(" ", strip=True))
-            if not t:
-                continue
-            if node.name == "li":
-                sections[current]["bullets"].append(t)
-            else:
-                sections[current]["text"] += (t + " ")
+        stop_levels = set()
+        if level == 2:
+            stop_levels = {"h2"}
+        elif level == 3:
+            stop_levels = {"h2", "h3"}
+        else:
+            stop_levels = {"h2", "h3", "h4"}
 
-    # clean up
-    for k in list(sections.keys()):
-        sections[k]["text"] = _clean_text(sections[k]["text"])
-        # avoid mega bullets
-        sections[k]["bullets"] = [b for b in sections[k]["bullets"] if 3 <= len(b) <= 220][:40]
+        chunks = []
+        cur = n.next_sibling
+        while cur is not None:
+            # bs4 sibling can be NavigableString
+            name = getattr(cur, "name", None)
+            if name in stop_levels:
+                break
 
-    return {"sections": sections, "order": order}
+            if name in ["p", "li", "ul", "ol", "div", "span"]:
+                txt = _clean_text(cur.get_text(" ", strip=True)) if hasattr(cur, "get_text") else _clean_text(str(cur))
+                if txt and len(txt) > 10:
+                    chunks.append(txt)
 
-def _count_media(soup: BeautifulSoup) -> dict:
-    imgs = soup.find_all("img")
-    videos = soup.find_all("video")
-    iframes = soup.find_all("iframe")
+            cur = cur.next_sibling
 
-    # "map" heuristics: google maps iframe or map keywords
-    has_map = False
-    for fr in iframes:
-        src = (fr.get("src") or "").lower()
-        if "google.com/maps" in src or "maps.google" in src:
-            has_map = True
-            break
-    if not has_map:
-        txt = soup.get_text(" ", strip=True).lower()
-        if "map" in txt and ("google" in txt or "location" in txt):
-            has_map = True
+            # safety: don't explode
+            if len(chunks) >= 20:
+                break
 
-    table_count = len(soup.find_all("table"))
+        section_texts[(level, title)] = _clean_text(" ".join(chunks))
 
-    return {
-        "image_count": len(imgs),
-        "video_count": len(videos),
-        "iframe_count": len(iframes),
-        "table_count": table_count,
-        "has_map": has_map,
-    }
+    return headings, section_texts
+
+
+def _extract_faq_questions(headings, section_texts, schema_types) -> list[str]:
+    # 1) if FAQPage schema exists, we'll still try to extract visible questions
+    # 2) find a heading containing "faq" or "frequently asked"
+    faq_titles = []
+    for h in headings:
+        t = h["text"].lower()
+        if "faq" in t or "frequently asked" in t:
+            faq_titles.append((h["level"], h["text"]))
+
+    questions = set()
+
+    # pull questions under FAQ headings
+    for (lvl, title) in faq_titles:
+        blob = section_texts.get((lvl, title), "")
+        for q in re.findall(r"([A-Z][^?]{10,120}\?)", blob):
+            questions.add(_clean_text(q))
+
+    # fallback: any headings that look like questions
+    for h in headings:
+        if "?" in h["text"] and len(h["text"]) <= 140:
+            questions.add(_clean_text(h["text"]))
+
+    out = [q for q in questions if q]
+    out.sort()
+    return out
+
 
 def parse_html(html: str, page_url: str = "") -> dict:
     soup = BeautifulSoup(html or "", "lxml")
@@ -212,49 +214,31 @@ def parse_html(html: str, page_url: str = "") -> dict:
         tag = soup.find("meta", attrs={"property": prop})
         return (tag.get("content") or "").strip() if tag else ""
 
-    h1 = [h.get_text(" ", strip=True) for h in soup.find_all("h1")]
-    h2 = [h.get_text(" ", strip=True) for h in soup.find_all("h2")]
-    h3 = [h.get_text(" ", strip=True) for h in soup.find_all("h3")]
+    container = _get_main_container(soup)
+    _strip_layout_noise(container)
 
-    # Clean visible text for word count
-    clean = BeautifulSoup(str(soup), "lxml")
-    for t in clean(["script", "style", "noscript"]):
-        t.decompose()
+    # headings + section texts
+    headings, section_texts = _build_headings_and_sections(container)
 
-    text = clean.get_text(" ", strip=True)
-    word_count = len(re.findall(r"\b\w+\b", text))
+    h1 = [_clean_text(h.get_text(" ", strip=True)) for h in soup.find_all("h1")]
+    h2 = [h["text"] for h in headings if h["level"] == 2]
+    h3 = [h["text"] for h in headings if h["level"] == 3]
+    h4 = [h["text"] for h in headings if h["level"] == 4]
 
-    # Schema types (simple list)
-    schema_types = []
-    jsonld_blobs = _extract_jsonld(soup)
-    for item in jsonld_blobs:
-        if isinstance(item, dict) and "@type" in item:
-            t = item["@type"]
-            if isinstance(t, list):
-                schema_types.extend([str(x) for x in t if x])
-            else:
-                schema_types.append(str(t))
+    raw_text = _clean_text(container.get_text(" ", strip=True))
+    word_count = len(re.findall(r"\b\w+\b", raw_text))
 
-    schema_types = list(dict.fromkeys([x for x in schema_types if x]))
+    schema_types = _extract_schema_types(soup)
+    schema_count = len(schema_types)
 
-    # FAQ detection
-    faq_q_jsonld = _find_faq_in_jsonld(jsonld_blobs)
-    faq_q_dom = _find_faq_in_dom(soup)
-    faq_questions = []
-    seen = set()
-    for q in (faq_q_jsonld + faq_q_dom):
-        k = q.lower().strip()
-        if k and k not in seen:
-            seen.add(k)
-            faq_questions.append(q)
+    media_counts = _count_media(container)
+    has_map = _has_map(container)
 
-    section_pack = _sectionize(soup)
-    media = _count_media(soup)
+    faq_questions = _extract_faq_questions(headings, section_texts, schema_types)
 
     return {
-        "page_url": page_url,
-        "source_name": _guess_source_name(page_url),
-
+        "page_url": page_url or "",
+        "competitor_name": _competitor_name_from_url(page_url or ""),
         "title": title,
         "meta_description": meta("description"),
         "robots": meta("robots"),
@@ -262,20 +246,20 @@ def parse_html(html: str, page_url: str = "") -> dict:
         "og_title": meta_prop("og:title"),
         "og_description": meta_prop("og:description"),
         "og_image": meta_prop("og:image"),
-
-        "h1": h1,
-        "h2": h2,
-        "h3": h3,
-
+        "h1": [x for x in h1 if x],
+        "h2": [x for x in h2 if x],
+        "h3": [x for x in h3 if x],
+        "h4": [x for x in h4 if x],
+        "headings": headings,                 # ordered list with levels
+        "section_texts": {
+            f"{lvl}:{txt}": section_texts.get((lvl, txt), "")
+            for (lvl, txt) in section_texts.keys()
+        },
+        "faq_questions": faq_questions,
         "word_count": word_count,
         "schema_types": schema_types,
-        "faq_questions": faq_questions,
-        "faq_count": len(faq_questions),
-
-        "sections": section_pack["sections"],
-        "section_order": section_pack["order"],
-
-        **media,
-
-        "raw_text": text,
+        "schema_count": schema_count,
+        "has_map": has_map,
+        **media_counts,
+        "raw_text": raw_text,
     }
