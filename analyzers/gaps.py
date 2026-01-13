@@ -11,39 +11,100 @@ from bs4 import BeautifulSoup
 # =====================================================
 # CONFIG
 # =====================================================
-_IGNORE_PATTERNS = [
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+IGNORE_PATTERNS = [
     r"subscribe", r"newsletter", r"looking to buy", r"looking to rent",
-    r"speak with us", r"contact us", r"register your interest",
-    r"get in touch", r"download", r"podcast", r"latest blogs",
+    r"get in touch", r"contact", r"download", r"latest", r"explore",
 ]
 
-_STOPWORDS = {
-    "about","above","after","again","against","along","among","around",
-    "because","before","being","below","between","could","does","doing",
-    "during","each","either","every","first","found","great","here","into",
-    "its","itself","many","might","more","most","other","over","some",
-    "such","than","that","their","there","these","those","through","under",
-    "very","what","where","which","while","would","your","yours",
-    "business","bay","dubai"
+STOPWORDS = {
+    "business","bay","dubai","about","this","that","with","from","your","their",
+    "there","where","which","while","would","could","should"
 }
 
 
 # =====================================================
-# HELPERS
+# SEMANTIC GAP RULES (THE HEART OF THE TOOL)
 # =====================================================
-def _clean(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+GAP_RULES = [
+    {
+        "key": "comparison",
+        "title": "Comparison with Other Dubai Neighborhoods",
+        "triggers": ["comparison", "vs", "versus", "other dubai", "neighborhood"],
+        "description": (
+            "Comparison between Business Bay and nearby areas such as JLT or Downtown Dubai, "
+            "highlighting differences in lifestyle, pricing, and community feel."
+        )
+    },
+    {
+        "key": "connectivity",
+        "title": "Location & Connectivity (expanded)",
+        "triggers": ["metro", "connectivity", "roads", "highway", "access", "central"],
+        "description": (
+            "Detailed explanation of transport links, road access, and the benefits of Business Bay’s "
+            "central location beyond a basic location overview."
+        )
+    },
+    {
+        "key": "pros_detail",
+        "title": "Detailed “Pros” sub-sections",
+        "triggers": ["pros", "advantages", "benefits"],
+        "description": (
+            "Breaks down advantages into clearer themes such as amenities, lifestyle, transport, "
+            "and community appeal rather than listing them briefly."
+        )
+    },
+    {
+        "key": "cons_detail",
+        "title": "Detailed “Cons” sub-sections",
+        "triggers": ["cons", "disadvantages", "challenges"],
+        "description": (
+            "Explicit breakdown of disadvantages like traffic congestion, high cost of living, "
+            "crowded areas, or limited green spaces."
+        )
+    },
+    {
+        "key": "extras",
+        "title": "Additional Reasons Some Prefer Business Bay",
+        "triggers": ["despite", "still choose", "why choose", "appeal"],
+        "description": (
+            "Explains why some residents prefer Business Bay despite the cons, focusing on lifestyle "
+            "trade-offs such as nightlife, dining, and professional networking."
+        )
+    },
+    {
+        "key": "final",
+        "title": "Final Thoughts / Conclusion",
+        "triggers": ["final thoughts", "conclusion", "summary", "wrap up"],
+        "description": (
+            "A closing synthesis weighing the pros and cons and advising which types of residents "
+            "Business Bay is most suitable for."
+        )
+    },
+    {
+        "key": "faq",
+        "title": "FAQs",
+        "triggers": ["faq", "frequently asked", "how much", "is it safe", "schools", "cost"],
+        "description": (
+            "Covers common reader questions such as cost of living, schools, safety, and the local "
+            "real estate market that are not addressed on Bayut."
+        )
+    },
+]
 
 
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9\s]", "", _clean(s).lower())
+# =====================================================
+# UTILITIES
+# =====================================================
+def clean(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip().lower()
 
 
-def _is_ignored_heading(title: str) -> bool:
-    return any(re.search(p, title.lower()) for p in _IGNORE_PATTERNS)
-
-
-def _competitor_label(url: str) -> str:
+def competitor_label(url: str) -> str:
     host = urlparse(url).netloc.lower()
     if "drivenproperties" in host:
         return "Driven Properties"
@@ -51,140 +112,80 @@ def _competitor_label(url: str) -> str:
         return "Property Finder"
     if "bayut" in host:
         return "Bayut"
-    if "dubizzle" in host:
-        return "Dubizzle"
     return host.replace("www.", "").split(".")[0].title()
 
 
-# =====================================================
-# FETCH & PARSE
-# =====================================================
-def _fetch_html(url: str) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    r = requests.get(url, headers=headers, timeout=25)
+def fetch_text(url: str) -> str:
+    r = requests.get(url, headers=HEADERS, timeout=25)
     r.raise_for_status()
-    return r.text
+    soup = BeautifulSoup(r.text, "html.parser")
 
-
-def _visible_text(el) -> str:
-    for bad in el.find_all(["script", "style", "noscript"]):
+    for bad in soup.find_all(["script", "style", "noscript", "footer", "nav"]):
         bad.decompose()
-    return _clean(el.get_text(" ", strip=True))
 
-
-def parse_page(url: str) -> Dict[str, Any]:
-    soup = BeautifulSoup(_fetch_html(url), "html.parser")
-
-    parsed = {
-        "competitor_name": _competitor_label(url),
-        "h2": [],
-        "h3": [],
-        "h4": [],
-        "faq_questions": [],
-    }
-
-    # Headings
-    for tag in ["h2", "h3", "h4"]:
-        for h in soup.find_all(tag):
-            title = _clean(h.get_text())
-            if title and not _is_ignored_heading(title):
-                parsed[tag].append(title)
-
-    # FAQs (JSON-LD only, no explosion)
-    for sc in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(sc.string or "")
-        except Exception:
-            continue
-        blocks = data if isinstance(data, list) else [data]
-        for b in blocks:
-            graph = b.get("@graph", [b])
-            for g in graph:
-                if g.get("@type") == "FAQPage":
-                    for q in g.get("mainEntity", []):
-                        qn = _clean(q.get("name", ""))
-                        if qn:
-                            parsed["faq_questions"].append(qn)
-
-    parsed["faq_questions"] = list(dict.fromkeys(parsed["faq_questions"]))
-    return parsed
+    return clean(soup.get_text(" "))
 
 
 # =====================================================
-# GAP ANALYSIS (FINAL LOGIC)
+# SIGNAL EXTRACTION
 # =====================================================
-def update_gaps(bayut: Dict[str, Any], competitors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def extract_signals(text: str) -> Dict[str, int]:
+    signals = {}
+    for rule in GAP_RULES:
+        count = 0
+        for t in rule["triggers"]:
+            count += len(re.findall(r"\b" + re.escape(t) + r"\b", text))
+        signals[rule["key"]] = count
+    return signals
+
+
+# =====================================================
+# GAP ANALYSIS (SEMANTIC)
+# =====================================================
+def analyze_gaps(bayut_text: str, comp_text: str, source: str) -> List[Dict[str, str]]:
+    bayut_signals = extract_signals(bayut_text)
+    comp_signals = extract_signals(comp_text)
+
     rows = []
 
-    bayut_heads = {_norm(h) for h in bayut["h2"] + bayut["h3"]}
+    for rule in GAP_RULES:
+        key = rule["key"]
 
-    for comp in competitors:
-        p = comp["parsed"]
-        source = p["competitor_name"]
-
-        # ---- Missing H2 / H3 (H4 grouped)
-        for h in p["h2"] + p["h3"]:
-            if _norm(h) in bayut_heads:
-                continue
-
-            # collect child H4s if any
-            children = [c for c in p["h4"] if _norm(h) in _norm(c)]
-            child_summary = ""
-            if children:
-                child_summary = f" Includes sub-sections such as {', '.join(children[:3])}."
-
+        # competitor meaningfully covers it, Bayut does not
+        if comp_signals[key] >= 3 and bayut_signals[key] < 2:
             rows.append({
-                "Missing header": h,
-                "What the header contains":
-                    f"This section is covered by the competitor but missing on Bayut.{child_summary}",
+                "Missing header": rule["title"],
+                "What the header contains": rule["description"],
                 "Source": source
             })
 
-        # ---- FAQs (ONE ROW ONLY)
-        bayut_faq = {_norm(q) for q in bayut["faq_questions"]}
-        missing_faq = [q for q in p["faq_questions"] if _norm(q) not in bayut_faq]
-
-        if missing_faq:
-            rows.append({
-                "Missing header": "FAQs",
-                "What the header contains":
-                    "Missing FAQ coverage such as: " + ", ".join(missing_faq[:5]) + ".",
-                "Source": source
-            })
-
-    # de-dup
-    seen = set()
-    out = []
-    for r in rows:
-        key = tuple(r.values())
-        if key not in seen:
-            seen.add(key)
-            out.append(r)
-
-    return out
+    return rows
 
 
 # =====================================================
-# ENTRY POINT
+# MAIN ENTRY POINT
 # =====================================================
 def analyze_article(bayut_url: str, competitor_urls: List[str]) -> Dict[str, Any]:
-    bayut = parse_page(bayut_url)
+    bayut_text = fetch_text(bayut_url)
+
     results = []
 
     for url in competitor_urls[:5]:
-        parsed = parse_page(url)
-        rows = update_gaps(
-            bayut,
-            [{"url": url, "parsed": parsed}]
+        comp_text = fetch_text(url)
+        source = competitor_label(url)
+
+        rows = analyze_gaps(
+            bayut_text=bayut_text,
+            comp_text=comp_text,
+            source=source
         )
+
         results.append({
-            "competitor": parsed["competitor_name"],
+            "competitor": source,
             "url": url,
             "rows": rows
         })
+
         time.sleep(0.4)
 
     return {
