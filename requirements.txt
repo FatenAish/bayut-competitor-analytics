@@ -4,3 +4,5 @@ beautifulsoup4
 lxml
 pandas
 openpyxl
+langchain-community
+faiss-cpu
